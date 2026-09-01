@@ -1,8 +1,10 @@
 // ==UserScript==
-// @name         CBT Anki 追加箱 v6.2
+// @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.2
+// @version      6.3
 // @description  CBT Medilink専用。同一chapter_codeの未完了演習を再利用し、統合JSON保存完了でセッションを閉じる。手動優先・○◎指定・貼り付け対応。
+// @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
+// @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @match        https://cbt.medilink-study.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
