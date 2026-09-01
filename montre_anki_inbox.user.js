@@ -1,34 +1,85 @@
 // ==UserScript==
 // @name         モントレ Anki 追加箱
 // @namespace    montre-anki-inbox
-// @version      1.3
-// @description  モントレCBT用。QB版同系統UI・全辺リサイズ・科目自動判定。GM権限明示注入ローダー。
+// @version      1.4
+// @description  モントレCBT用。回答後画面認識・科目自動取得hotfix。QB版同系統UI・全辺リサイズ維持。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js
 // @match        https://m3e-medical.com/*
 // @match        https://*.m3e-medical.com/*
-// @match        https://m3e.jp/*
-// @match        https://*.m3e.jp/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
 // @grant        GM_info
-// @connect      *
+// @connect      raw.githubusercontent.com
 // @run-at       document-idle
 // ==/UserScript==
 
 (async () => {
   "use strict";
-  const p1 = "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[... truncated in transcript for brevity ...]
-  const payload = p1 + p2 + p3;
-  const binary = atob(payload);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
-  const source = await new Response(stream).text();
-  const run = new Function("GM_getValue", "GM_setValue", "GM_xmlhttpRequest", "GM_info", source);
-  run(GM_getValue, GM_setValue, typeof GM_xmlhttpRequest === "function" ? GM_xmlhttpRequest : undefined, GM_info);
+
+  const CACHE_KEY = "montre_anki_runtime_source_v14";
+  const V13_URL = "https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/ff2e13b7d5d32f56ebb339082e7eaf0040fb10db/montre_anki_inbox.user.js";
+
+  function requestText(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET",
+        url,
+        onload: (res) => {
+          if (res.status >= 200 && res.status < 300) resolve(res.responseText);
+          else reject(new Error(`HTTP ${res.status}`));
+        },
+        onerror: () => reject(new Error("GitHub取得失敗"))
+      });
+    });
+  }
+
+  async function gunzipBase64(payload) {
+    const binary = atob(payload);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return await new Response(stream).text();
+  }
+
+  function replaceOnce(source, oldText, newText, label) {
+    if (!source.includes(oldText)) throw new Error(`v1.4 ${label}対象が見つかりません`);
+    return source.replace(oldText, newText);
+  }
+
+  async function buildRuntimeSource() {
+    const wrapper = await requestText(V13_URL);
+    const chunks = [...wrapper.matchAll(/const p\d+\s*=\s*"([A-Za-z0-9+/=]+)";/g)].map(m => m[1]);
+    if (!chunks.length) throw new Error("v1.3本体を抽出できません");
+
+    let source = await gunzipBase64(chunks.join(""));
+    source = replaceOnce(source, "  function looksLikeMontreQuestionPage(doc = document) {\n    const text = getPageText(doc);\n    const progress = parseProgress(text);\n\n    if (!progress) return false;\n\n    return Boolean(\n      /次の問題|スキップして次へ|正答|正解|解説|自己評価/.test(text) ||\n      [...doc.querySelectorAll(\"a,button,[role='button']\")]\n        .some((el) =>\n          /次の問題|スキップして次へ/.test(normalizedLabel(el))\n        )\n    );\n  }\n", "  function looksLikeMontreQuestionPage(doc = document) {\n    const text = getPageText(doc);\n    const currentUrl =\n      doc === document\n        ? location.href\n        : String(doc?.URL || \"\");\n\n    const progress = parseProgress(text);\n    const number =\n      parseProblemNumber(doc, currentUrl || location.href);\n\n    const urlLooksLikeQuestion =\n      /\\/users\\/cbt\\/practice_questions(?:\\/|$)/i.test(\n        currentUrl || location.href\n      );\n\n    const hasQuestionSignals =\n      /問題番号|次の問題|スキップして次へ|正答|正解|解説を見る|自己評価|回答を終了する/.test(\n        text\n      );\n\n    const hasNextControl =\n      [...doc.querySelectorAll(\"a,button,[role='button']\")]\n        .some((el) =>\n          /次の問題|スキップして次へ|回答を終了する/.test(\n            normalizedLabel(el)\n          )\n        );\n\n    return Boolean(\n      (number && hasQuestionSignals) ||\n      (urlLooksLikeQuestion && (hasQuestionSignals || hasNextControl)) ||\n      (progress && (hasQuestionSignals || hasNextControl))\n    );\n  }\n", "patch1");
+    source = replaceOnce(source, "  function detectSubjectFromPage(doc = document) {\n    const lines = getPageLines(doc);\n    const candidates = [];\n", "  function detectSubjectFromPage(doc = document) {\n    const lines = getPageLines(doc);\n    const candidates = [];\n    const fullText = getPageText(doc);\n\n    for (const division of [\"基礎医学\", \"臨床医学\"]) {\n      const divisionIndex = fullText.lastIndexOf(division);\n      if (divisionIndex < 0) continue;\n\n      const tail = fullText.slice(divisionIndex, divisionIndex + 220);\n\n      for (const [canonical, aliases] of SUBJECT_ALIASES) {\n        for (const alias of aliases) {\n          const aliasIndex = tail.indexOf(alias);\n          if (aliasIndex > 0 && aliasIndex <= 120) {\n            const detected = {\n              subject: canonical,\n              division,\n              source: \"montre-division-subject-text\",\n              evidence: `${division} → ${alias}`\n            };\n            lastSubjectDetection = detected;\n            return detected;\n          }\n        }\n      }\n    }\n", "patch2");
+    source = replaceOnce(source, "    const sameTotal =\n      !session.totalQuestions ||\n      session.totalQuestions === parseProgress(getPageText())?.total;\n\n    if (!wasUnset && session.subject === detected.subject) return;\n    if (!sameTotal) return;\n", "    const currentTotal =\n      parseProgress(getPageText())?.total || null;\n\n    const sameTotal =\n      wasUnset ||\n      !session.totalQuestions ||\n      !currentTotal ||\n      session.totalQuestions === currentTotal;\n\n    if (!wasUnset && session.subject === detected.subject) return;\n    if (!sameTotal) return;\n", "patch3");
+    source = replaceOnce(source, "    if (\n      looksLikeMontreQuestionPage()\n    ) {\n      maybeAutoUpdateSubject();\n      ensureActiveSession();\n    }\n\n    updateUI();\n", "    maybeAutoUpdateSubject();\n\n    if (\n      looksLikeMontreQuestionPage()\n    ) {\n      ensureActiveSession();\n    }\n\n    updateUI();\n", "patch4");
+    source = replaceOnce(source, "        : \"問題画面ではありません。演習中の候補・履歴はそのまま保持されています。\";\n", "        : (\n            info.problemNumber\n              ? `問題番号 ${info.problemNumber} は取得済み ／ 回答後画面を確認中`\n              : \"問題画面ではありません。演習中の候補・履歴はそのまま保持されています。\"\n          );\n", "patch5");
+    source = source.replace("// @version      1.2", "// @version      1.4");
+    source = source.replace('\"1.2-qb-style-ui\"', '\"1.4-answer-screen-hotfix\"');
+    return source;
+  }
+
+  let source = GM_getValue(CACHE_KEY, "");
+  if (!source || !source.includes("montre-division-subject-text")) {
+    source = await buildRuntimeSource();
+    GM_setValue(CACHE_KEY, source);
+  }
+
+  const run = new Function(
+    "GM_getValue",
+    "GM_setValue",
+    "GM_xmlhttpRequest",
+    "GM_info",
+    source
+  );
+
+  run(GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_info);
 })().catch((error) => {
-  console.error("モントレ Anki 追加箱 v1.3 起動エラー", error);
-  alert("モントレ Anki v1.3 起動失敗: " + (error?.name || "Error") + "\n" + (error?.message || String(error)));
+  console.error("モントレ Anki v1.4 起動エラー", error);
+  alert("モントレ Anki v1.4 起動失敗: " + (error?.message || String(error)));
 });
