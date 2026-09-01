@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ Anki 追加箱
 // @namespace    montre-anki-inbox
-// @version      2.0
+// @version      2.1.0
 // @description  モントレCBT専用。QB版に合わせた手動候補・科目自動判定・○でも自動指定・全問JSON取得。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js
@@ -32,6 +32,8 @@
   const COUNTER_KEY = "montre_anki_manual_counters_v1";
   const SESSION_KEY = "montre_anki_exercise_state_v1";
   const GEOMETRY_KEY = "montre_anki_panel_geometry_v1";
+  const PANEL_STATE_KEY = "montre_anki_panel_state_v1";
+  const LAST_SUBJECT_KEY = "montre_anki_last_subject_v1";
   const ROOT_ID = "montre-anki-inbox-v20";
   const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
@@ -81,6 +83,8 @@
   let lastUrl = location.href;
   let toastTimer = null;
   let resizeState = null;
+  let exportRunning = false;
+  let monitorQueued = false;
   const nextBypass = new WeakSet();
 
   const $ = (id) => shadow?.getElementById(id);
@@ -157,7 +161,7 @@
   }
 
   function parseProgress(text = bodyText()) {
-    const match = String(text).match(/(\d+)\s*問目\s*[\/／]\s*(\d+)\s*問中/);
+    const match = String(text).match(/(\d+)\s*問目\s*[\/／]\s*(\d+)\s*問\s*中/);
     return match ? { current: Number(match[1]), total: Number(match[2]) } : null;
   }
 
@@ -175,52 +179,179 @@
     return false;
   }
 
+  function normalizeSubjectLabel(raw) {
+    return String(raw || "")
+      .normalize("NFKC")
+      .replace(/[（(]\s*\d+\s*[）)]\s*$/, "")
+      .replace(/(?:科目|領域|分野)\s*$/g, "")
+      .replace(/[\s　・･\/／>＞→:：|｜,，.。\-_–—]+/g, "")
+      .trim();
+  }
+
   function canonicalSubject(raw) {
-    const clean = String(raw || "").replace(/[（(]\s*\d+\s*[）)]\s*$/, "").trim();
+    const clean = normalizeSubjectLabel(raw);
     for (const [canonical, aliases] of SUBJECTS) {
-      if (aliases.some((alias) => clean === alias)) return canonical;
+      if (aliases.some((alias) => clean === normalizeSubjectLabel(alias))) return canonical;
     }
     return null;
   }
 
-  function detectSubject(doc = document) {
+  function findSubjectInText(raw) {
+    const clean = normalizeSubjectLabel(raw);
+    const aliases = SUBJECTS.flatMap(([canonical, values]) =>
+      values.map((alias) => ({ canonical, alias, clean: normalizeSubjectLabel(alias) }))
+    ).sort((a, b) => b.clean.length - a.clean.length);
+    return aliases.find((entry) => entry.clean && clean.includes(entry.clean)) || null;
+  }
+
+  function makeSubjectResult(division, match, source) {
+    if (!match?.canonical) return null;
+    const resolvedDivision =
+      division || (BASIC.has(match.canonical) ? "基礎医学" : "臨床医学");
+    return {
+      division: resolvedDivision,
+      subject: match.canonical,
+      source,
+      evidence: `${resolvedDivision} → ${match.alias}`
+    };
+  }
+
+  function detectSubjectDirect(doc = document) {
     const allLines = lines(doc);
     const explanationIndexes = [];
     allLines.forEach((line, index) => {
-      if (line === "解説を見る") explanationIndexes.push(index);
+      if (line.includes("解説を見る")) explanationIndexes.push(index);
     });
 
     for (let e = explanationIndexes.length - 1; e >= 0; e--) {
       const start = explanationIndexes[e];
       for (let i = start + 1; i < Math.min(allLines.length, start + 120); i++) {
-        if (allLines[i] !== "基礎医学" && allLines[i] !== "臨床医学") continue;
-        const division = allLines[i];
-        for (let j = i + 1; j < Math.min(allLines.length, i + 8); j++) {
-          const subject = canonicalSubject(allLines[j]);
-          if (subject) {
-            return {
-              division, subject, source: "解説後の分類",
-              evidence: `${division} → ${allLines[j]}`
-            };
-          }
-        }
+        const division = allLines[i].includes("基礎医学")
+          ? "基礎医学"
+          : allLines[i].includes("臨床医学") ? "臨床医学" : null;
+        if (!division) continue;
+        const nearby = allLines.slice(i, Math.min(allLines.length, i + 9)).join(" ");
+        const result = makeSubjectResult(
+          division,
+          findSubjectInText(nearby.replace(division, "")),
+          "解説後の分類"
+        );
+        if (result) return result;
       }
     }
 
-    for (let i = allLines.length - 1; i >= 0; i--) {
-      if (allLines[i] !== "基礎医学" && allLines[i] !== "臨床医学") continue;
-      const division = allLines[i];
-      for (let j = i + 1; j < Math.min(allLines.length, i + 8); j++) {
-        const subject = canonicalSubject(allLines[j]);
-        if (subject) {
-          return {
-            division, subject, source: "本文末尾の分類",
-            evidence: `${division} → ${allLines[j]}`
-          };
-        }
+    const fullText = bodyText(doc).normalize("NFKC");
+    for (const division of ["基礎医学", "臨床医学"]) {
+      let index = fullText.lastIndexOf(division);
+      while (index >= 0) {
+        const tail = fullText.slice(index + division.length, index + division.length + 240);
+        const result = makeSubjectResult(
+          division,
+          findSubjectInText(tail),
+          "医学区分付近の分類"
+        );
+        if (result) return result;
+        index = fullText.lastIndexOf(division, index - 1);
       }
     }
+
+    const semanticSelectors = [
+      "nav",
+      "[aria-label*='パンくず']",
+      "[aria-label*='breadcrumb' i]",
+      "[class*='breadcrumb' i]",
+      "[class*='category' i]",
+      "[class*='subject' i]"
+    ];
+    for (const element of doc.querySelectorAll(semanticSelectors.join(","))) {
+      const text = normalize(element.innerText || element.textContent || "");
+      if (!text || text.length > 500) continue;
+      const division = text.includes("基礎医学")
+        ? "基礎医学"
+        : text.includes("臨床医学") ? "臨床医学" : null;
+      const result = makeSubjectResult(
+        division,
+        findSubjectInText(text.replace(/基礎医学|臨床医学/g, "")),
+        "パンくず・分類表示"
+      );
+      if (result) return result;
+    }
+
+    const explicit = fullText.match(
+      /(?:科目|分野|領域|カテゴリ(?:ー)?)\s*[:：]\s*([^\n]{1,40})/
+    );
+    if (explicit) {
+      const result = makeSubjectResult(
+        null,
+        findSubjectInText(explicit[1]),
+        "科目ラベル"
+      );
+      if (result) return result;
+    }
+
+    for (const script of doc.querySelectorAll("script")) {
+      const source = script.textContent || "";
+      if (!source || source.length > 2_000_000) continue;
+      const match = source.match(
+        /["'](?:subject|subject_name|subjectName|category_name|categoryName|field_name)["']\s*[:=]\s*["']([^"']{1,50})["']/i
+      );
+      if (!match) continue;
+      const result = makeSubjectResult(
+        null,
+        findSubjectInText(match[1]),
+        "ページ内データ"
+      );
+      if (result) return result;
+    }
+
+    for (let i = allLines.length - 1; i >= 0; i--) {
+      const division = allLines[i].includes("基礎医学")
+        ? "基礎医学"
+        : allLines[i].includes("臨床医学") ? "臨床医学" : null;
+      if (!division) continue;
+      const nearby = allLines.slice(i, Math.min(allLines.length, i + 9)).join(" ");
+      const result = makeSubjectResult(
+        division,
+        findSubjectInText(nearby.replace(division, "")),
+        "本文末尾の分類"
+      );
+      if (result) return result;
+    }
     return null;
+  }
+
+  function getLastSubjectContext() {
+    const value = getValue(LAST_SUBJECT_KEY, null);
+    return value && typeof value === "object" ? value : null;
+  }
+
+  function saveLastSubjectContext(detected, doc = document) {
+    if (!detected?.subject) return;
+    setValue(LAST_SUBJECT_KEY, {
+      division: detected.division,
+      subject: detected.subject,
+      evidence: detected.evidence,
+      totalQuestions: parseProgress(bodyText(doc))?.total || null,
+      pageUrl: doc === document ? location.href : String(doc?.URL || ""),
+      detectedAt: now()
+    });
+  }
+
+  function detectSubject(doc = document, { allowCached = true } = {}) {
+    const direct = detectSubjectDirect(doc);
+    if (direct) return direct;
+    if (!allowCached || !isQuestionPage(doc)) return null;
+
+    const cached = getLastSubjectContext();
+    if (!cached?.subject) return null;
+    const total = parseProgress(bodyText(doc))?.total || null;
+    if (cached.totalQuestions && total && cached.totalQuestions !== total) return null;
+    return {
+      division: cached.division,
+      subject: cached.subject,
+      source: "直前ページの自動取得",
+      evidence: `${cached.division} → ${cached.subject}（前ページから継続）`
+    };
   }
 
   function getSettings() {
@@ -238,6 +369,9 @@
   function syncSubjectFromPage() {
     const detected = detectSubject();
     if (!detected) return null;
+    if (detected.source !== "直前ページの自動取得") {
+      saveLastSubjectContext(detected);
+    }
     const current = getSettings();
     if (current.division !== detected.division || current.subject !== detected.subject) {
       saveSettings({ division: detected.division, subject: detected.subject });
@@ -610,17 +744,66 @@
   }
 
   function findNextHref(doc, baseUrl) {
-    const links = [...doc.querySelectorAll("a[href]")];
-    const next = links.find((a) => {
-      const value = controlLabel(a);
-      return value === "次の問題" || value === "次の問題へ" || value.includes("スキップして次へ");
-    });
-    if (!next) return null;
-    try {
-      return new URL(next.getAttribute("href"), baseUrl).href.split("#")[0];
-    } catch {
-      return null;
+    const isNext = (element) => {
+      const value = controlLabel(element);
+      return value === "次の問題" ||
+        value === "次の問題へ" ||
+        value === "次へ" ||
+        value.includes("スキップして次へ");
+    };
+    const toUrl = (raw) => {
+      if (!raw || /^\s*(?:#|javascript:)/i.test(raw)) return null;
+      try {
+        return new URL(raw, baseUrl).href.split("#")[0];
+      } catch {
+        return null;
+      }
+    };
+
+    const relNext = doc.querySelector("a[rel~='next'][href], link[rel~='next'][href]");
+    if (relNext) {
+      const url = toUrl(relNext.getAttribute("href"));
+      if (url) return url;
     }
+
+    const controls = [...doc.querySelectorAll(
+      "a[href], button, [role='button'], input[type='button'], input[type='submit']"
+    )].filter(isNext);
+
+    for (const control of controls) {
+      for (const attribute of ["href", "data-href", "data-url", "formaction"]) {
+        const url = toUrl(control.getAttribute(attribute));
+        if (url) return url;
+      }
+
+      const parentLink = control.closest?.("a[href]");
+      const parentUrl = toUrl(parentLink?.getAttribute("href"));
+      if (parentUrl) return parentUrl;
+
+      const form = control.form || control.closest?.("form");
+      if (form && String(form.method || "get").toLowerCase() === "get") {
+        const action = toUrl(form.getAttribute("action") || baseUrl);
+        if (action) {
+          try {
+            const nextUrl = new URL(action);
+            for (const field of form.querySelectorAll("input[name], select[name]")) {
+              if (field.disabled || !field.name) continue;
+              if ((field.type === "checkbox" || field.type === "radio") && !field.checked) continue;
+              nextUrl.searchParams.set(field.name, field.value || "");
+            }
+            return nextUrl.href.split("#")[0];
+          } catch {}
+        }
+      }
+
+      const inline = control.getAttribute("onclick") || "";
+      const inlineMatch = inline.match(
+        /(?:location(?:\.href)?\s*=|window\.open\s*\()\s*["']([^"']+)["']/i
+      );
+      const inlineUrl = toUrl(inlineMatch?.[1]);
+      if (inlineUrl) return inlineUrl;
+    }
+    return null;
   }
 
   function detectSelfRating(doc) {
@@ -705,11 +888,11 @@
   }
 
   async function exportAllQuestions() {
+    if (exportRunning) return toast("全問取得は実行中です");
     syncSubjectFromPage();
-    const settings = getSettings();
+    let settings = getSettings();
     const p = parseProgress();
     if (!isQuestionPage()) return toast("モントレの問題画面で実行してください");
-    if (!settings.subject) return toast("科目を取得できません");
     if (!p?.total) return toast("全問題数を取得できません。1問目で実行してください");
 
     if (p.current !== 1) {
@@ -717,9 +900,15 @@
       if (!proceed) return;
     }
 
-    const session = ensureSession();
-    const manual = session ? sessionItems(session.id) : [];
-    const overrides = session ? getOverrides(session.id) : [];
+    exportRunning = true;
+    const exportButton = $("export-all");
+    if (exportButton) {
+      exportButton.disabled = true;
+      exportButton.textContent = "全問取得中…";
+    }
+
+    try {
+    let session = ensureSession();
     const questions = [];
     const visitedUrls = new Set();
     const visitedProblemNumbers = new Set();
@@ -736,6 +925,18 @@
         const html = await response.text();
         const doc = new DOMParser().parseFromString(html, "text/html");
         const question = snapshotQuestion(doc, url);
+        if (
+          question.subjectContext?.subject &&
+          question.subjectContext.source !== "直前ページの自動取得"
+        ) {
+          saveLastSubjectContext(question.subjectContext, doc);
+          saveSettings({
+            division: question.subjectContext.division,
+            subject: question.subjectContext.subject
+          });
+          settings = getSettings();
+          if (!session) session = ensureSession();
+        }
 
         if (question.problemNumber && visitedProblemNumbers.has(question.problemNumber)) {
           error = `問題番号 ${question.problemNumber} を再検出したため停止`;
@@ -758,6 +959,8 @@
       }
     }
 
+    const manual = session ? sessionItems(session.id) : [];
+    const overrides = session ? getOverrides(session.id) : [];
     const problemNumbers = new Set(
       questions.map((question) => String(question.problemNumber || "")).filter(Boolean)
     );
@@ -770,7 +973,7 @@
 
     const output = {
       source: SOURCE,
-      exporterVersion: "2.0-clean-direct",
+      exporterVersion: "2.1.0",
       expectedQuestions: p.total,
       retrievedQuestions: questions.length,
       complete: questions.length === p.total && !error,
@@ -798,7 +1001,7 @@
       questions
     };
 
-    const safeSubject = settings.subject.replace(/[\\/:*?"<>|]/g, "_");
+    const safeSubject = (settings.subject || "科目未設定").replace(/[\\/:*?"<>|]/g, "_");
     const filename = `montre_${safeSubject}_${questions.length}questions_with_answers.json`;
     downloadJson(output, filename);
 
@@ -817,6 +1020,14 @@
       ? `${questions.length}問＋手動${includedManual.length}件を書き出しました`
       : `${questions.length}/${p.total}問で停止：${error || "不明"}`
     );
+    } finally {
+      exportRunning = false;
+      const button = $("export-all");
+      if (button) {
+        button.disabled = false;
+        button.textContent = "モントレ全問＋手動候補を取得";
+      }
+    }
   }
 
   function exportManualOnly() {
@@ -991,6 +1202,30 @@
     return { width: Number(value?.width) || 370, height: Number(value?.height) || 620 };
   }
 
+  function getPanelState() {
+    const value = getValue(PANEL_STATE_KEY, {});
+    return { open: Boolean(value?.open) };
+  }
+
+  function setPanelOpen(open) {
+    setValue(PANEL_STATE_KEY, { open: Boolean(open) });
+    if (!panel || !$("launcher")) return;
+    panel.classList.toggle("open", Boolean(open));
+    $("launcher").style.display = open ? "none" : "";
+  }
+
+  function openPanel() {
+    setPanelOpen(true);
+    syncSubjectFromPage();
+    ensureSession();
+    render();
+  }
+
+  function closePanel() {
+    setPanelOpen(false);
+    saveGeometry();
+  }
+
   function applyGeometry() {
     const geometry = getGeometry();
     const width = Math.min(Math.max(320, geometry.width), Math.max(320, innerWidth - 24));
@@ -1149,7 +1384,7 @@
     <div id="toast"></div>
   `;
 
-  function createUi() {
+  function createUi(draft = null) {
     document.getElementById(ROOT_ID)?.remove();
     host = document.createElement("div");
     host.id = ROOT_ID;
@@ -1163,18 +1398,8 @@
     panel = $("panel");
     applyGeometry();
 
-    $("launcher").onclick = () => {
-      panel.classList.add("open");
-      $("launcher").style.display = "none";
-      syncSubjectFromPage();
-      ensureSession();
-      render();
-    };
-    $("close").onclick = () => {
-      panel.classList.remove("open");
-      $("launcher").style.display = "";
-      saveGeometry();
-    };
+    $("launcher").onclick = openPanel;
+    $("close").onclick = closePanel;
     $("redetect").onclick = () => {
       const detected = syncSubjectFromPage();
       if (detected) {
@@ -1217,6 +1442,12 @@
     grip.addEventListener("pointermove", moveResize);
     grip.addEventListener("pointerup", endResize);
     grip.addEventListener("pointercancel", endResize);
+    if (draft) {
+      $("memo").value = draft.memo || "";
+      $("also-auto").checked = Boolean(draft.alsoAutomatic);
+    }
+    setPanelOpen(getPanelState().open);
+    renderImages();
     render();
   }
 
@@ -1240,8 +1471,7 @@
     const target = event.target;
     if (target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable) return;
     event.preventDefault();
-    panel.classList.add("open");
-    $("launcher").style.display = "none";
+    setPanelOpen(true);
     captureSelection();
   }, true);
 
@@ -1267,7 +1497,28 @@
     setTimeout(() => control.click(), 0);
   }, true);
 
+  function readUiDraft() {
+    return {
+      memo: $("memo")?.value || "",
+      alsoAutomatic: Boolean($("also-auto")?.checked)
+    };
+  }
+
+  function ensureUiMounted() {
+    if (
+      host?.isConnected &&
+      document.getElementById(ROOT_ID) === host &&
+      shadow &&
+      panel
+    ) {
+      return;
+    }
+    const draft = readUiDraft();
+    createUi(draft);
+  }
+
   function monitor() {
+    ensureUiMounted();
     const urlChanged = location.href !== lastUrl;
     if (urlChanged) {
       lastUrl = location.href;
@@ -1283,6 +1534,15 @@
     render();
   }
 
+  function scheduleMonitor() {
+    if (monitorQueued) return;
+    monitorQueued = true;
+    setTimeout(() => {
+      monitorQueued = false;
+      monitor();
+    }, 80);
+  }
+
   try {
     createUi();
     if (isQuestionPage()) {
@@ -1290,14 +1550,18 @@
       ensureSession();
     }
     render();
-    setInterval(monitor, 1800);
-    console.info("[Montre Anki] v2.0 started", {
+    const observer = new MutationObserver(scheduleMonitor);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    window.addEventListener("popstate", scheduleMonitor);
+    window.addEventListener("hashchange", scheduleMonitor);
+    setInterval(monitor, 1000);
+    console.info("[Montre Anki] v2.1.0 started", {
       problemNumber: parseProblemNumber(),
       progress: parseProgress(),
       subject: detectSubject()
     });
   } catch (error) {
-    console.error("[Montre Anki] v2.0 startup error", error);
-    alert("モントレ Anki v2.0 起動エラー\n" + (error?.message || String(error)));
+    console.error("[Montre Anki] v2.1.0 startup error", error);
+    alert("モントレ Anki v2.1.0 起動エラー\n" + (error?.message || String(error)));
   }
 })();
