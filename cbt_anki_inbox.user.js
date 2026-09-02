@@ -165,7 +165,7 @@
   }
 
   // 「QB全問＋手動候補を取得」は new Function(exporterCode) で起動される。
-  // v6.3本体を変更せず、実行直前のExporterだけを安全に差し替える。
+  // ボタンを押した瞬間だけ Function を差し替え、イベント処理後に必ず戻す。
   function PatchedFunction(...args) {
     const patchedArgs = args.map((arg, index) =>
       index === args.length - 1 && typeof arg === "string"
@@ -186,29 +186,94 @@
 
   Object.setPrototypeOf(PatchedFunction, NativeFunction);
   PatchedFunction.prototype = NativeFunction.prototype;
-  globalThis.Function = PatchedFunction;
 
-  // 「QB取得コードをコピー」でも同じ修正済みコードを取得できるようにする。
-  function patchClipboardWriteText() {
+  function patchRunButtonForOneClick() {
+    const originalFunction = globalThis.Function;
+    globalThis.Function = PatchedFunction;
+
+    setTimeout(() => {
+      if (globalThis.Function === PatchedFunction) {
+        globalThis.Function = originalFunction;
+      }
+    }, 0);
+  }
+
+  function patchCopyButtonForOneClick() {
     const clipboard = navigator.clipboard;
     if (!clipboard || typeof clipboard.writeText !== "function") return;
 
-    const original = clipboard.writeText.bind(clipboard);
+    const ownDescriptor = Object.getOwnPropertyDescriptor(clipboard, "writeText");
+    const originalWriteText = clipboard.writeText.bind(clipboard);
 
     try {
       Object.defineProperty(clipboard, "writeText", {
         configurable: true,
         writable: true,
         value(text) {
-          return original(patchQBExporterSource(text));
+          return originalWriteText(patchQBExporterSource(text));
         }
       });
     } catch (error) {
-      console.warn("[CBT Anki v6.4] Clipboard hotfixを適用できませんでした。", error);
+      console.warn(
+        "[CBT Anki v6.4] Clipboard hotfixを適用できませんでした。",
+        error
+      );
+      return;
     }
+
+    setTimeout(() => {
+      try {
+        if (ownDescriptor) {
+          Object.defineProperty(clipboard, "writeText", ownDescriptor);
+        } else {
+          delete clipboard.writeText;
+        }
+      } catch (_) {}
+    }, 0);
   }
 
-  patchClipboardWriteText();
+  function attachHotfixHooks() {
+    const host = document.getElementById("cbt-anki-root-v62");
+    const shadow = host?.shadowRoot;
+
+    if (!shadow) return false;
+
+    const runButton = shadow.getElementById("run-qb-exporter");
+    const copyButton = shadow.getElementById("copy-qb-exporter");
+
+    if (runButton && !runButton.dataset.qbRatingFixV64) {
+      runButton.dataset.qbRatingFixV64 = "1";
+      runButton.addEventListener(
+        "click",
+        patchRunButtonForOneClick,
+        true
+      );
+    }
+
+    if (copyButton && !copyButton.dataset.qbRatingFixV64) {
+      copyButton.dataset.qbRatingFixV64 = "1";
+      copyButton.addEventListener(
+        "click",
+        patchCopyButtonForOneClick,
+        true
+      );
+    }
+
+    return Boolean(runButton || copyButton);
+  }
+
+  if (!attachHotfixHooks()) {
+    const observer = new MutationObserver(() => {
+      if (attachHotfixHooks()) observer.disconnect();
+    });
+
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true
+    });
+
+    setTimeout(() => observer.disconnect(), 15000);
+  }
 
   console.info(
     "[CBT Anki v6.4] QB最新自己評価hotfixを有効化しました。"
