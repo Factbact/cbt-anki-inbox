@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.4
-// @description  CBT Medilink専用。v6.3を維持しつつ、QB最新自己評価の△/○/◎取得を補強する。
+// @version      6.5
+// @description  CBT Medilink専用。QB全問取得時に、回答前の最新履歴を保存して△/×判定の上書きを防ぐ。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @match        https://cbt.medilink-study.com/*
@@ -17,9 +17,20 @@
 (() => {
   "use strict";
 
-  const HOTFIX_MARKER = "__CBT_VISIBLE_TOP_RATING_FIX_V64__";
+  const HOTFIX_MARKER = "__CBT_PRE_REVEAL_HISTORY_FIX_V65__";
   const EXPORTER_SIGNATURE = "QB -> Anki JSON Exporter";
   const NativeFunction = globalThis.Function;
+
+  function replaceOnce(source, needle, replacement, label) {
+    if (!source.includes(needle)) {
+      console.warn(`[CBT Anki v6.5] ${label} の置換対象を検出できませんでした。`);
+      return { source, ok: false };
+    }
+    return {
+      source: source.replace(needle, replacement),
+      ok: true
+    };
+  }
 
   function patchQBExporterSource(source) {
     if (
@@ -32,140 +43,161 @@
     }
 
     let patched = source;
+    let result;
 
-    const helper = `
-    // ${HOTFIX_MARKER}
-    // 最新回の自己評価は、履歴DOMより現在画面上部の表示を優先する。
-    // QB側の履歴行DOMが入れ子になった場合やSVG構造が変わった場合でも、
-    // 「自己評価」ラベル周辺から△/○/◎を回収する。
-    function detectVisibleTopSelfRating(doc) {
-      const empty = {
-        selfRating: null,
-        source: null,
-        evidence: null
-      };
+    // 1) 最小コンテナに△SVGが入っていない時は、同じ履歴行の親要素まで探索する。
+    result = replaceOnce(
+      patched,
+      `      const rating = detectRatingFromHistoryRow(row);
 
-      if (!doc || !doc.body) return empty;
+      return {`,
+      `      let rating = detectRatingFromHistoryRow(row);
 
-      const candidates = [
-        ...doc.querySelectorAll("div, section, article, p, span, dt, dd, li")
-      ]
-        .filter((element) => {
-          const text = normalizeText(
-            element.innerText || element.textContent || ""
+      if (!rating?.selfRating) {
+        let parent = row.parentElement;
+
+        for (let depth = 0; parent && depth < 5; depth += 1) {
+          const parentText = normalizeText(
+            parent.innerText || parent.textContent || ""
           );
+          const parentDates =
+            parentText.match(/\\b20\\d{2}\\/\\d{1,2}\\/\\d{1,2}\\b/g) || [];
 
-          return (
-            /自己評価\\s*[：:]?/.test(text) &&
-            text.length <= 120
-          );
-        })
-        .sort((a, b) => {
-          const aText = normalizeText(a.innerText || a.textContent || "");
-          const bText = normalizeText(b.innerText || b.textContent || "");
-          return aText.length - bText.length;
-        });
+          // 別の履歴行まで含む親には上がらない。
+          if (parentDates.length !== 1 || parentText.length > 320) break;
 
-      for (const label of candidates) {
-        let node = label;
-
-        for (let depth = 0; node && depth < 4; depth += 1) {
-          const text = normalizeText(
-            node.innerText || node.textContent || ""
-          );
-
-          // 解答履歴全体など大きすぎる親要素まで遡らない。
-          if (depth > 0 && text.length > 260) break;
-
-          const rating = detectRatingFromHistoryRow(node);
-
-          if (rating?.selfRating) {
-            return {
-              selfRating: rating.selfRating,
-              source: String(rating.source || "DOM:visible_top")
-                .replace("DOM:answer_history", "DOM:visible_top"),
-              evidence: rating.evidence ?? "visible_top_container"
+          const parentRating = detectRatingFromHistoryRow(parent);
+          if (parentRating?.selfRating) {
+            rating = {
+              ...parentRating,
+              source: String(parentRating.source || "DOM:answer_history")
+                .replace(
+                  "DOM:answer_history",
+                  "DOM:answer_history_ancestor"
+                )
             };
+            break;
           }
 
-          node = node.parentElement;
+          parent = parent.parentElement;
         }
       }
 
-      // テキストとして評価記号が描画される場合の最終フォールバック。
-      // 「解答履歴」より前だけを見ることで過去履歴の評価を拾わない。
-      const visibleText = normalizeText(
-        doc.body.innerText || doc.body.textContent || ""
-      );
-      const beforeHistory = visibleText.split("解答履歴")[0];
-      const match = beforeHistory.match(
-        /自己評価\\s*[：:]?\\s*([△○◎])/
-      );
-
-      if (match) {
-        return {
-          selfRating: match[1],
-          source: "DOM:visible_top_text",
-          evidence: "visible_top_text_fallback"
-        };
-      }
-
-      return empty;
-    }
-`;
-
-    const capturePattern = /(^|\n)\s*async function capture\(doc\) \{/;
-
-    if (capturePattern.test(patched)) {
-      patched = patched.replace(
-        capturePattern,
-        (match, prefix) =>
-          `${prefix}${helper}\n    async function capture(doc) {`
-      );
-    } else {
-      console.warn("[CBT Anki v6.4] capture() を検出できず、自己評価hotfixを挿入できませんでした。");
-      return source;
-    }
-
-    const selfRatingPattern =
-      /const selfRating\s*=\s*domAttempt\?\.selfRating\s*\?\?\s*structuredAttempt\?\.selfRating\s*\?\?\s*null\s*;/;
-
-    if (!selfRatingPattern.test(patched)) {
-      console.warn("[CBT Anki v6.4] selfRating判定ブロックを検出できませんでした。");
-      return source;
-    }
-
-    patched = patched.replace(
-      selfRatingPattern,
-      `const visibleTopRating = detectVisibleTopSelfRating(doc);\n      const selfRating =\n        visibleTopRating?.selfRating ??\n        domAttempt?.selfRating ??\n        structuredAttempt?.selfRating ??\n        null;`
+      return {`,
+      "履歴行の祖先SVG探索"
     );
+    if (!result.ok) return source;
+    patched = result.source;
 
-    // JSON上の根拠も、実際に採用した最新画面表示と一致させる。
-    patched = patched.replace(
-      /selfRatingSource:\s*domAttempt\?\.selfRating\s*\?\s*domAttempt\.selfRatingSource\s*:\s*\(\s*structuredAttempt\?\.selfRating\s*\?\s*["']internal_user_status["']\s*:\s*null\s*\),/,
-      `selfRatingSource:\n          visibleTopRating?.selfRating\n            ? visibleTopRating.source\n            : (\n                domAttempt?.selfRating\n                  ? domAttempt.selfRatingSource\n                  : (\n                      structuredAttempt?.selfRating\n                        ? "internal_user_status"\n                        : null\n                    )\n              ),`
+    // 2) 同じ回答履歴を、selfRatingの有無だけで別行として重複扱いしない。
+    result = replaceOnce(
+      patched,
+      `        const key = [
+          item.attempt.answeredDateText || "",
+          item.attempt.usersAnswer || "",
+          item.attempt.correctness || "",
+          item.attempt.selfRating || ""
+        ].join("|");`,
+      `        const key = [
+          item.attempt.answeredDateText || "",
+          item.attempt.usersAnswer || "",
+          item.attempt.correctness || ""
+        ].join("|");`,
+      "履歴行dedupキー"
     );
+    if (!result.ok) return source;
+    patched = result.source;
 
-    patched = patched.replace(
-      /selfRatingEvidence:\s*domAttempt\?\.selfRatingEvidence\s*\?\?\s*null,/,
-      `selfRatingEvidence:\n          visibleTopRating?.selfRating\n            ? visibleTopRating.evidence\n            : (domAttempt?.selfRatingEvidence ?? null),`
+    // 3) 同一履歴の候補では、最小要素より「自己評価を実際に持つ要素」を優先する。
+    result = replaceOnce(
+      patched,
+      `        if (
+          !existing ||
+          item.textLength < existing.textLength ||
+          (
+            item.textLength === existing.textLength &&
+            item.domIndex < existing.domIndex
+          )
+        ) {
+          dedup.set(key, item);
+        }`,
+      `        const itemHasRating = Boolean(item.attempt.selfRating);
+        const existingHasRating = Boolean(existing?.attempt?.selfRating);
+
+        if (
+          !existing ||
+          (itemHasRating && !existingHasRating) ||
+          (
+            itemHasRating === existingHasRating &&
+            (
+              item.textLength < existing.textLength ||
+              (
+                item.textLength === existing.textLength &&
+                item.domIndex < existing.domIndex
+              )
+            )
+          )
+        ) {
+          dedup.set(key, item);
+        }`,
+      "評価付き履歴行の優先"
     );
+    if (!result.ok) return source;
+    patched = result.source;
 
-    patched = patched.replace(
-      "visibleTopSelfRatingUsedForFiltering: false",
-      "visibleTopSelfRatingUsedForFiltering: true"
+    // 4) revealAnswer() が新しい回答履歴を作る前に、元の最新履歴を退避する。
+    result = replaceOnce(
+      patched,
+      `          const reveal = await revealAnswer(doc, progress);`,
+      `          // ${HOTFIX_MARKER}
+          // 重要: revealAnswer() はQBへ新しい回答履歴を作ることがある。
+          // その前に、今回の演習開始時点の最新履歴・自己評価を保存する。
+          const preRevealSnapshot = await capture(doc);
+
+          const reveal = await revealAnswer(doc, progress);`,
+      "回答前スナップショット"
     );
+    if (!result.ok) return source;
+    patched = result.source;
 
+    // 5) 解説は回答後の画面から取得するが、判定用latestAttemptは回答前の値を戻す。
+    result = replaceOnce(
+      patched,
+      `          results.push(await capture(doc));`,
+      `          const capturedAfterReveal = await capture(doc);
+
+          if (
+            preRevealSnapshot?.answerHistory?.captureStatus === "captured" &&
+            preRevealSnapshot?.latestAttempt
+          ) {
+            capturedAfterReveal.latestAttempt =
+              preRevealSnapshot.latestAttempt;
+            capturedAfterReveal.answerHistory =
+              preRevealSnapshot.answerHistory;
+            capturedAfterReveal.preRevealLatestAttemptPreserved = true;
+          } else {
+            capturedAfterReveal.preRevealLatestAttemptPreserved = false;
+          }
+
+          results.push(capturedAfterReveal);`,
+      "回答前latestAttemptの復元"
+    );
+    if (!result.ok) return source;
+    patched = result.source;
+
+    // 6) 出力メタデータを更新。
     patched = patched.replace(
-      "latest answer-history DOM row; SVG triangle detection; internal user_status fallback",
-      "visible top self-rating; latest answer-history DOM row; SVG triangle detection; internal user_status fallback"
+      `exporterVersion: "3.6-reusable-session-lifecycle"`,
+      `exporterVersion: "3.7-pre-reveal-history-preserved"`
+    );
+    patched = patched.replace(
+      `source: "latest answer-history DOM row; SVG triangle detection; internal user_status fallback"`,
+      `source: "pre-reveal latest answer-history DOM row; ancestor SVG triangle detection; internal user_status fallback"`
     );
 
     return patched;
   }
 
-  // 「QB全問＋手動候補を取得」は new Function(exporterCode) で起動される。
-  // ボタンを押した瞬間だけ Function を差し替え、イベント処理後に必ず戻す。
   function PatchedFunction(...args) {
     const patchedArgs = args.map((arg, index) =>
       index === args.length - 1 && typeof arg === "string"
@@ -186,96 +218,34 @@
 
   Object.setPrototypeOf(PatchedFunction, NativeFunction);
   PatchedFunction.prototype = NativeFunction.prototype;
+  globalThis.Function = PatchedFunction;
 
-  function patchRunButtonForOneClick() {
-    const originalFunction = globalThis.Function;
-    globalThis.Function = PatchedFunction;
-
-    setTimeout(() => {
-      if (globalThis.Function === PatchedFunction) {
-        globalThis.Function = originalFunction;
-      }
-    }, 0);
-  }
-
-  function patchCopyButtonForOneClick() {
+  // 「QB取得コードをコピー」でも同じ修正済みExporterを取得できるようにする。
+  function patchClipboardWriteText() {
     const clipboard = navigator.clipboard;
     if (!clipboard || typeof clipboard.writeText !== "function") return;
 
-    const ownDescriptor = Object.getOwnPropertyDescriptor(clipboard, "writeText");
-    const originalWriteText = clipboard.writeText.bind(clipboard);
+    const original = clipboard.writeText.bind(clipboard);
 
     try {
       Object.defineProperty(clipboard, "writeText", {
         configurable: true,
         writable: true,
         value(text) {
-          return originalWriteText(patchQBExporterSource(text));
+          return original(patchQBExporterSource(text));
         }
       });
     } catch (error) {
       console.warn(
-        "[CBT Anki v6.4] Clipboard hotfixを適用できませんでした。",
+        "[CBT Anki v6.5] Clipboard hotfixを適用できませんでした。",
         error
       );
-      return;
     }
-
-    setTimeout(() => {
-      try {
-        if (ownDescriptor) {
-          Object.defineProperty(clipboard, "writeText", ownDescriptor);
-        } else {
-          delete clipboard.writeText;
-        }
-      } catch (_) {}
-    }, 0);
   }
 
-  function attachHotfixHooks() {
-    const host = document.getElementById("cbt-anki-root-v62");
-    const shadow = host?.shadowRoot;
-
-    if (!shadow) return false;
-
-    const runButton = shadow.getElementById("run-qb-exporter");
-    const copyButton = shadow.getElementById("copy-qb-exporter");
-
-    if (runButton && !runButton.dataset.qbRatingFixV64) {
-      runButton.dataset.qbRatingFixV64 = "1";
-      runButton.addEventListener(
-        "click",
-        patchRunButtonForOneClick,
-        true
-      );
-    }
-
-    if (copyButton && !copyButton.dataset.qbRatingFixV64) {
-      copyButton.dataset.qbRatingFixV64 = "1";
-      copyButton.addEventListener(
-        "click",
-        patchCopyButtonForOneClick,
-        true
-      );
-    }
-
-    return Boolean(runButton || copyButton);
-  }
-
-  if (!attachHotfixHooks()) {
-    const observer = new MutationObserver(() => {
-      if (attachHotfixHooks()) observer.disconnect();
-    });
-
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true
-    });
-
-    setTimeout(() => observer.disconnect(), 15000);
-  }
+  patchClipboardWriteText();
 
   console.info(
-    "[CBT Anki v6.4] QB最新自己評価hotfixを有効化しました。"
+    "[CBT Anki v6.5] 回答前履歴保存 + △SVG祖先探索hotfixを有効化しました。"
   );
 })();
