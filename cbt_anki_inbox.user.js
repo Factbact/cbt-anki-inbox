@@ -45,7 +45,6 @@
     let patched = source;
     let result;
 
-    // 1) 最小コンテナに△SVGが入っていない時は、同じ履歴行の親要素まで探索する。
     result = replaceOnce(
       patched,
       `      const rating = detectRatingFromHistoryRow(row);
@@ -63,7 +62,6 @@
           const parentDates =
             parentText.match(/\\b20\\d{2}\\/\\d{1,2}\\/\\d{1,2}\\b/g) || [];
 
-          // 別の履歴行まで含む親には上がらない。
           if (parentDates.length !== 1 || parentText.length > 320) break;
 
           const parentRating = detectRatingFromHistoryRow(parent);
@@ -89,7 +87,6 @@
     if (!result.ok) return source;
     patched = result.source;
 
-    // 2) 同じ回答履歴を、selfRatingの有無だけで別行として重複扱いしない。
     result = replaceOnce(
       patched,
       `        const key = [
@@ -108,7 +105,6 @@
     if (!result.ok) return source;
     patched = result.source;
 
-    // 3) 同一履歴の候補では、最小要素より「自己評価を実際に持つ要素」を優先する。
     result = replaceOnce(
       patched,
       `        if (
@@ -145,13 +141,10 @@
     if (!result.ok) return source;
     patched = result.source;
 
-    // 4) revealAnswer() が新しい回答履歴を作る前に、元の最新履歴を退避する。
     result = replaceOnce(
       patched,
       `          const reveal = await revealAnswer(doc, progress);`,
       `          // ${HOTFIX_MARKER}
-          // 重要: revealAnswer() はQBへ新しい回答履歴を作ることがある。
-          // その前に、今回の演習開始時点の最新履歴・自己評価を保存する。
           const preRevealSnapshot = await capture(doc);
 
           const reveal = await revealAnswer(doc, progress);`,
@@ -160,7 +153,6 @@
     if (!result.ok) return source;
     patched = result.source;
 
-    // 5) 解説は回答後の画面から取得するが、判定用latestAttemptは回答前の値を戻す。
     result = replaceOnce(
       patched,
       `          results.push(await capture(doc));`,
@@ -185,7 +177,6 @@
     if (!result.ok) return source;
     patched = result.source;
 
-    // 6) 出力メタデータを更新。
     patched = patched.replace(
       `exporterVersion: "3.6-reusable-session-lifecycle"`,
       `exporterVersion: "3.7-pre-reveal-history-preserved"`
@@ -220,7 +211,6 @@
   PatchedFunction.prototype = NativeFunction.prototype;
   globalThis.Function = PatchedFunction;
 
-  // 「QB取得コードをコピー」でも同じ修正済みExporterを取得できるようにする。
   function patchClipboardWriteText() {
     const clipboard = navigator.clipboard;
     if (!clipboard || typeof clipboard.writeText !== "function") return;
