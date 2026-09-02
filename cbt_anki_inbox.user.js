@@ -26,10 +26,7 @@
       console.warn(`[CBT Anki v6.5] ${label} の置換対象を検出できませんでした。`);
       return { source, ok: false };
     }
-    return {
-      source: source.replace(needle, replacement),
-      ok: true
-    };
+    return { source: source.replace(needle, replacement), ok: true };
   }
 
   function patchQBExporterSource(source) {
