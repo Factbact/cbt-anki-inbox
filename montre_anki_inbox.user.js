@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.4.0
+// @version      2.4.1
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -1517,7 +1517,7 @@
     var payload = {
       schemaVersion: "Montore_Anki_Backup_v2",
       exportType: "backup",
-      note: "保管用。questionsは閲覧時のキャッシュのみ。Anki作成には「Anki作成用JSON」を使用。",
+      note: "保管用。questionsは閲覧時のキャッシュのみ。Anki作成には「問題データのダウンロード」を使用。",
       questions: Object.keys(state.questionCache).map(function (id) { return state.questionCache[id]; }),
       source: "モントレ",
       generatedAt: nowIso(),
@@ -1543,7 +1543,7 @@
       }
     };
     downloadJson(payload, "montre_BACKUP_" + nowIso().replace(/[:.]/g, "-") + ".json");
-    setStatus("保管用バックアップを保存しました。Anki作成には上の「Anki作成用JSON」を押してください", "info");
+    setStatus("保管用バックアップを保存しました。Anki作成には上の「問題データのダウンロード」を押してください", "info");
   }
 
   function checkpointSummary(session) {
@@ -1928,16 +1928,14 @@
         "<div class='mai-card'>" +
           "<div class='mai-title'>途中の区切りを記録</div>" +
           "<div id='mai-checkpoint-info' class='mai-muted' style='margin-bottom:6px'></div>" +
-          "<button class='mai-btn primary' id='mai-checkpoint-export' type='button' style='width:100%;margin-bottom:6px'>ここまで記録してJSON取得</button>" +
+          "<button class='mai-btn primary' id='mai-checkpoint-export' type='button' style='width:100%;margin-bottom:6px'>表示中の問題まで保存して、中断位置を記録</button>" +
           "<div class='mai-muted' style='margin-bottom:10px'>表示中の問題までを取得。初回は1問目から、次回はデータ確認済みの続きから。未回答でも押した位置を区切りとして記録します。</div>" +
-          "<div class='mai-title'>JSON取得範囲（手動指定）</div>" +
+          "<div class='mai-title'>問題データのダウンロード</div>" +
           "<div class='mai-row' style='margin-bottom:6px'>" +
           "<label style='flex:1'>開始（問目）<input class='mai-input' id='mai-range-start' type='number' min='1' step='1' placeholder='例：20'></label>" +
           "<label style='flex:1'>終了（問目）<input class='mai-input' id='mai-range-end' type='number' min='1' step='1' placeholder='例：40'></label></div>" +
-          "<div class='mai-muted' style='margin-bottom:6px'>両方空欄なら全問。指定時は両端を含む範囲と、その問題の手動候補を保存。</div>" +
-          "<button class='mai-btn primary' id='mai-export' type='button' style='width:100%'>Anki作成用JSON（問題・解答・手動候補）</button>" +
-          "<button class='mai-btn' id='mai-visited-range' type='button' style='width:100%;margin-top:6px'>記録済みの問数を範囲に設定</button>" +
-          "<div class='mai-muted'>例：52問目まで記録済みなら、開始1・終了52を入力します。</div>" +
+          "<div class='mai-muted' style='margin-bottom:6px'>開始1・終了50なら、1〜50問だけを保存。問題文・選択肢・正答・解説・解答記録・手動候補をJSON形式で保存します。両方空欄なら全問。</div>" +
+          "<button class='mai-btn primary' id='mai-export' type='button' style='width:100%'>指定した範囲をダウンロード</button>" +
           "<details style='margin-top:10px'><summary>保管用バックアップ（通常のAnki作成には使わない）</summary>" +
           "<button class='mai-btn' id='mai-manual-export' type='button' style='width:100%;margin-top:6px'>保存済みデータをバックアップ</button></details>" +
           "<div class='mai-muted' style='margin-top:5px'>演習内の問題ページから取得できます。未演習・取得不足もJSONに保存します。</div>" +
@@ -1986,14 +1984,8 @@
     });
     ui.pageImage.addEventListener("click", addHoveredImage);
     ui.forceAuto.addEventListener("click", toggleAutomaticOverride);
-    panel.querySelector("#mai-visited-range").addEventListener("click", function () {
-      if (!currentSession || exportRunning) return;
-      var positions = currentSession.questionRefs.map(function (ref) { return ref.position; }).filter(function (n) { return Number.isInteger(n) && n > 0; });
-      if (!positions.length) { setStatus("問題ページを一度開いてください", "error"); return; }
-      ui.rangeStart.value = 1;
-      ui.rangeEnd.value = Math.max.apply(null, positions);
-      setStatus("範囲を1〜" + ui.rangeEnd.value + "問目に設定しました。上のAnki作成用JSONを押してください", "info");
-    });
+    ui.rangeStart.addEventListener("input", render);
+    ui.rangeEnd.addEventListener("input", render);
     ui.exportButton.addEventListener("click", exportAllQuestions);
     ui.manualExportButton.addEventListener("click", exportManualBackup);
     ui.drop.addEventListener("dragover", function (event) {
@@ -2323,7 +2315,9 @@
     ui.rangeEnd.disabled = exportRunning;
     ui.exportButton.disabled = exportRunning || !currentSession;
     ui.exportButton.textContent = exportRunning ?
-      "全問取得中…" : "Anki作成用JSON（問題・解答・手動候補）";
+      "問題データを取得中…" :
+      (!ui.rangeStart.value && !ui.rangeEnd.value ? "全問をダウンロード" :
+        ui.rangeStart.value && ui.rangeEnd.value ? ui.rangeStart.value + "〜" + ui.rangeEnd.value + "問をダウンロード" : "開始・終了を入力してください");
     renderWarnings();
   }
 
