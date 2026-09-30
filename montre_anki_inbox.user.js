@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.2.2
+// @version      2.3.0
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.2.2";
+  var VERSION = "2.3.0";
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
@@ -1332,7 +1332,7 @@
     return Array.from(new Set(errors));
   }
 
-  async function crawlSessionQuestions(session) {
+  async function crawlSessionQuestions(session, range) {
     var startUrl = findSessionStartUrl(session);
     if (!startUrl) throw new Error("問題ページを一度開いてから実行してください");
     var results = [];
@@ -1358,7 +1358,9 @@
         var doc = url === location.href ? document : await fetchQuestionPage(url);
         var question = extractQuestion(doc, url);
         if (!question) throw new Error("問題番号を取得できません（ログイン状態・ページ形式を確認）");
-        if (!seenIds.has(question.problemNumber)) {
+        var inRange = !range || (Number.isInteger(question.position) &&
+          question.position >= range.start && question.position <= range.end);
+        if (inRange && !seenIds.has(question.problemNumber)) {
           seenIds.add(question.problemNumber);
           question.acquisition = {
             answerAvailable: Boolean(question.correctAnswer && question.correctAnswer.length),
@@ -1369,23 +1371,31 @@
           results.push(question);
           state.questionCache[question.problemNumber] = question;
         }
-        enqueue(question.previousQuestionUrl);
-        enqueue(question.nextQuestionUrl);
+        if (!range || !Number.isInteger(question.position) || question.position > range.start) {
+          enqueue(question.previousQuestionUrl);
+        }
+        if (!range || !Number.isInteger(question.position) || question.position < range.end) {
+          enqueue(question.nextQuestionUrl);
+        }
+        if (range && results.length === range.count) break;
       } catch (error) {
         failures.push({ url: url, message: error.message || String(error) });
       }
       if (queue.length) await sleep(140);
     }
-    if (queue.length) failures.push({ message: "取得上限に到達したため巡回を停止しました" });
+    if (queue.length && seenUrls.size >= limit) failures.push({ message: "取得上限に到達したため巡回を停止しました" });
     results.sort(function (a, b) { return (a.position || 99999) - (b.position || 99999); });
     results.acquisitionFailures = failures;
     saveState(true);
     return results;
   }
 
-  function buildExportPayload(session, questions) {
+  function buildExportPayload(session, questions, range) {
+    var includedIds = new Set(questions.map(function (question) { return question.problemNumber; }));
     var sessionClassification = buildClassification(session.division, session.subject);
-    var manualCandidates = activeCandidatesForSession(session.id).map(function (candidate) {
+    var manualCandidates = activeCandidatesForSession(session.id).filter(function (candidate) {
+      return !range || includedIds.has(candidate.problemNumber);
+    }).map(function (candidate) {
       var copy = Object.assign({}, candidate);
       var candidateClassification = candidate.classification || buildClassification(
         candidate.largeCategory || candidate.division,
@@ -1398,7 +1408,7 @@
       return copy;
     });
     var overrides = state.automaticOverrides.filter(function (entry) {
-      return entry.sessionId === session.id && !entry.deletedAt;
+      return entry.sessionId === session.id && !entry.deletedAt && (!range || includedIds.has(entry.problemNumber));
     }).map(function (entry) {
       return Object.assign({}, entry);
     });
@@ -1500,6 +1510,21 @@
     setStatus("手動候補のバックアップJSONを保存しました", "success");
   }
 
+  function parseExportRange(startValue, endValue, total) {
+    var first = String(startValue || "").trim();
+    var last = String(endValue || "").trim();
+    if (!first && !last) return null;
+    if (!/^\d+$/.test(first) || !/^\d+$/.test(last)) {
+      throw new Error("開始・終了の両方に1以上の整数を入力してください");
+    }
+    var start = Number(first), end = Number(last);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start) {
+      throw new Error("1 ≦ 開始 ≦ 終了となる範囲を入力してください");
+    }
+    if (total && end > total) throw new Error("終了は全" + total + "問以内で指定してください");
+    return { start: start, end: end, count: end - start + 1 };
+  }
+
   async function exportAllQuestions() {
     if (exportRunning) return;
     if (!currentSession) {
@@ -1518,36 +1543,58 @@
       setStatus("⚠ 分類を自動取得できません。手動設定してください", "error");
       return;
     }
+    var range;
+    try {
+      range = parseExportRange(ui.rangeStart.value, ui.rangeEnd.value, currentSession.expectedTotal);
+    } catch (error) {
+      setStatus(error.message, "error");
+      return;
+    }
     exportRunning = true;
     render();
     try {
       var session = currentSession;
-      var questions = await crawlSessionQuestions(session);
-      var errors = validateExportQuestions(questions, session);
+      var questions = await crawlSessionQuestions(session, range);
+      var errors = validateExportQuestions(questions,
+        range ? Object.assign({}, session, { expectedTotal: range.count }) : session);
+      var missingPositions = [];
+      if (range) {
+        var positions = new Set(questions.map(function (q) { return q.position; }));
+        for (var position = range.start; position <= range.end; position += 1) {
+          if (!positions.has(position)) missingPositions.push(position);
+        }
+        if (missingPositions.length) errors.push("指定範囲内の未取得位置: " + missingPositions.join(", "));
+      }
       var failures = questions.acquisitionFailures || [];
-      var payload = buildExportPayload(session, questions);
+      var payload = buildExportPayload(session, questions, range);
+      payload.exportScope = range ? {
+        mode: "range", start: range.start, end: range.end,
+        expectedTotal: range.count, acquiredTotal: questions.length,
+        missingPositions: missingPositions
+      } : { mode: "all", expectedTotal: session.expectedTotal, acquiredTotal: questions.length };
       payload.exportValidation = {
         complete: errors.length === 0 && failures.length === 0,
         warnings: errors,
         acquisitionFailures: failures,
         note: "未演習・取得不足も保存。空欄の正答・解説・自己評価は推測して補完しない。"
       };
-      payload.exerciseSession.status = payload.exportValidation.complete ? "completed" : "partial";
-      payload.exerciseSession.completedAt = payload.exportValidation.complete ? nowIso() : null;
+      payload.exerciseSession.status = !range && payload.exportValidation.complete ? "completed" : "partial";
+      payload.exerciseSession.completedAt = !range && payload.exportValidation.complete ? nowIso() : null;
       var safeSubject = (currentSession.division + "_" + currentSession.subject)
         .replace(/[\\/:*?"<>|\s]+/g, "_");
-      var fileName = "montre_anki_" + safeSubject + "_" +
+      var fileName = "montre_anki_" + safeSubject + (range ? "_" + range.start + "-" + range.end + "問" : "") + "_" +
         nowIso().replace(/[:.]/g, "-") + ".json";
       downloadJson(payload, fileName);
       var exportedAt = nowIso();
+      var exportedCandidateIds = new Set(payload.manualCandidates.candidates.map(function (candidate) { return candidate.id; }));
       activeCandidatesForSession(currentSession.id).forEach(function (candidate) {
-        if (!candidate.exportedAt) candidate.exportedAt = exportedAt;
+        if (exportedCandidateIds.has(candidate.id) && !candidate.exportedAt) candidate.exportedAt = exportedAt;
       });
       currentSession.status = payload.exerciseSession.status;
       currentSession.completedAt = payload.exerciseSession.completedAt;
       currentSession.exportedAt = exportedAt;
       currentSession.exportedFileName = fileName;
-      state.pendingSessionId = payload.exportValidation.complete ? null : currentSession.id;
+      state.pendingSessionId = !range && payload.exportValidation.complete ? null : currentSession.id;
       saveState(true);
       setStatus(questions.length + "問と手動候補のJSONを保存しました" +
         (payload.exportValidation.complete ? "" : "（取得不足あり。JSON内のexportValidationを確認）"),
@@ -1785,7 +1832,12 @@
           "<div id='mai-candidates'></div>" +
         "</div>" +
         "<div class='mai-card'>" +
-          "<button class='mai-btn primary' id='mai-export' type='button' style='width:100%'>モントレ全問＋手動候補を取得</button>" +
+          "<div class='mai-title'>JSON取得範囲</div>" +
+          "<div class='mai-row' style='margin-bottom:6px'>" +
+          "<label style='flex:1'>開始（問目）<input class='mai-input' id='mai-range-start' type='number' min='1' step='1' placeholder='例：20'></label>" +
+          "<label style='flex:1'>終了（問目）<input class='mai-input' id='mai-range-end' type='number' min='1' step='1' placeholder='例：40'></label></div>" +
+          "<div class='mai-muted' style='margin-bottom:6px'>両方空欄なら全問。指定時は両端を含む範囲と、その問題の手動候補を保存。</div>" +
+          "<button class='mai-btn primary' id='mai-export' type='button' style='width:100%'>指定範囲／全問＋手動候補を取得</button>" +
           "<button class='mai-btn' id='mai-manual-export' type='button' style='width:100%;margin-top:6px'>手動候補バックアップJSON</button>" +
           "<div class='mai-muted' style='margin-top:5px'>演習内の問題ページから取得できます。未演習・取得不足もJSONに保存します。</div>" +
         "</div>" +
@@ -1808,6 +1860,8 @@
     ui.forceAuto = panel.querySelector("#mai-force-auto");
     ui.subjectFallback = panel.querySelector("#mai-subject-fallback");
     ui.candidates = panel.querySelector("#mai-candidates");
+    ui.rangeStart = panel.querySelector("#mai-range-start");
+    ui.rangeEnd = panel.querySelector("#mai-range-end");
     ui.exportButton = panel.querySelector("#mai-export");
     ui.manualExportButton = panel.querySelector("#mai-manual-export");
     ui.history = panel.querySelector("#mai-history");
@@ -2143,9 +2197,11 @@
     renderSubjectFallback();
     renderCandidates();
     renderHistory();
+    ui.rangeStart.disabled = exportRunning;
+    ui.rangeEnd.disabled = exportRunning;
     ui.exportButton.disabled = exportRunning || !currentSession;
     ui.exportButton.textContent = exportRunning ?
-      "全問取得中…" : "モントレ全問＋手動候補を取得";
+      "全問取得中…" : "指定範囲／全問＋手動候補を取得";
     renderWarnings();
   }
 
@@ -2221,3 +2277,4 @@
 
   start();
 })();
+
