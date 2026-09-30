@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.3.0
+// @version      2.3.1
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.3.0";
+  var VERSION = "2.3.1";
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
@@ -240,7 +240,7 @@
 
   function findExplicitQuestionContext(doc) {
     var anchors = Array.prototype.slice.call(
-      doc.querySelectorAll("a[href*='/users/montore/questions/search?category_id=']")
+      doc.querySelectorAll("a[href*='/questions/search?category_id=']")
     );
     var groups = {};
     anchors.forEach(function (anchor) {
@@ -359,7 +359,16 @@
 
   function getDocumentText(doc) {
     var body = doc && doc.body;
-    return normalizeText(body ? (body.innerText || body.textContent || "") : "");
+    if (!body) return "";
+    if (body.innerText) return normalizeText(body.innerText);
+    // DOMParserで取得したHTMLでもブロック境界を保ち、正答・問題文の行を検出する。
+    var clone = body.cloneNode(true);
+    Array.prototype.forEach.call(clone.querySelectorAll("script,style,noscript,#montre-anki-panel,#montre-anki-toggle"), function (el) { el.remove(); });
+    Array.prototype.forEach.call(clone.querySelectorAll("br,p,div,li,h1,h2,h3,h4,tr,section,button"), function (el) {
+      el.appendChild(doc.createTextNode("\n"));
+      if (el.parentNode) el.parentNode.insertBefore(doc.createTextNode("\n"), el);
+    });
+    return normalizeText(clone.textContent || "");
   }
 
   function parseQuestionPosition(doc) {
@@ -1338,7 +1347,7 @@
     var results = [];
     var seenUrls = new Set();
     var seenIds = new Set();
-    var queue = [startUrl].concat((session.questionRefs || []).map(function (ref) { return ref.url; }));
+    var queue = [];
     var failures = [];
     var limit = Math.max(Number(session.expectedTotal || 0) * 2 + 10, 500);
     function enqueue(value) {
@@ -1349,13 +1358,19 @@
       parsed.hash = "";
       if (!seenUrls.has(parsed.href) && queue.indexOf(parsed.href) < 0) queue.push(parsed.href);
     }
+    enqueue(startUrl);
+    (session.questionRefs || []).forEach(function (ref) {
+      if (!range || !Number.isInteger(ref.position) || (ref.position >= range.start && ref.position <= range.end)) enqueue(ref.url);
+    });
     while (queue.length && seenUrls.size < limit) {
       var url = queue.shift();
       if (!url || seenUrls.has(url)) continue;
       seenUrls.add(url);
       setStatus("問題取得中 " + results.length + " / " + (session.expectedTotal || "?") + "問", "info");
       try {
-        var doc = url === location.href ? document : await fetchQuestionPage(url);
+        var liveUrl = new URL(location.href);
+        liveUrl.hash = "";
+        var doc = url === liveUrl.href ? document : await fetchQuestionPage(url);
         var question = extractQuestion(doc, url);
         if (!question) throw new Error("問題番号を取得できません（ログイン状態・ページ形式を確認）");
         var inRange = !range || (Number.isInteger(question.position) &&
@@ -1482,7 +1497,10 @@
       }
     }
     var payload = {
-      schemaVersion: "Montore_Anki_Manual_Backup_v1",
+      schemaVersion: "Montore_Anki_Backup_v2",
+      exportType: "backup",
+      note: "保管用。questionsは閲覧時のキャッシュのみ。Anki作成には「Anki作成用JSON」を使用。",
+      questions: Object.keys(state.questionCache).map(function (id) { return state.questionCache[id]; }),
       source: "モントレ",
       generatedAt: nowIso(),
       generator: { name: APP_NAME, version: VERSION },
@@ -1506,8 +1524,8 @@
         entries: state.automaticOverrides.filter(function (entry) { return !entry.deletedAt; })
       }
     };
-    downloadJson(payload, "montre_manual_candidates_" + nowIso().replace(/[:.]/g, "-") + ".json");
-    setStatus("手動候補のバックアップJSONを保存しました", "success");
+    downloadJson(payload, "montre_BACKUP_" + nowIso().replace(/[:.]/g, "-") + ".json");
+    setStatus("保管用バックアップを保存しました。Anki作成には上の「Anki作成用JSON」を押してください", "info");
   }
 
   function parseExportRange(startValue, endValue, total) {
@@ -1572,7 +1590,10 @@
         expectedTotal: range.count, acquiredTotal: questions.length,
         missingPositions: missingPositions
       } : { mode: "all", expectedTotal: session.expectedTotal, acquiredTotal: questions.length };
+      payload.exportType = "anki_questions";
+      var contentCount = questions.filter(function (q) { return q.questionText && q.choices && q.choices.length; }).length;
       payload.exportValidation = {
+        questionsWithTextAndChoices: contentCount,
         complete: errors.length === 0 && failures.length === 0,
         warnings: errors,
         acquisitionFailures: failures,
@@ -1596,7 +1617,7 @@
       currentSession.exportedFileName = fileName;
       state.pendingSessionId = !range && payload.exportValidation.complete ? null : currentSession.id;
       saveState(true);
-      setStatus(questions.length + "問と手動候補のJSONを保存しました" +
+      setStatus(questions.length + "問を出力／問題文・選択肢あり " + contentCount + "問" +
         (payload.exportValidation.complete ? "" : "（取得不足あり。JSON内のexportValidationを確認）"),
         payload.exportValidation.complete ? "success" : "info");
     } catch (error) {
@@ -1837,8 +1858,11 @@
           "<label style='flex:1'>開始（問目）<input class='mai-input' id='mai-range-start' type='number' min='1' step='1' placeholder='例：20'></label>" +
           "<label style='flex:1'>終了（問目）<input class='mai-input' id='mai-range-end' type='number' min='1' step='1' placeholder='例：40'></label></div>" +
           "<div class='mai-muted' style='margin-bottom:6px'>両方空欄なら全問。指定時は両端を含む範囲と、その問題の手動候補を保存。</div>" +
-          "<button class='mai-btn primary' id='mai-export' type='button' style='width:100%'>指定範囲／全問＋手動候補を取得</button>" +
-          "<button class='mai-btn' id='mai-manual-export' type='button' style='width:100%;margin-top:6px'>手動候補バックアップJSON</button>" +
+          "<button class='mai-btn primary' id='mai-export' type='button' style='width:100%'>Anki作成用JSON（問題・解答・手動候補）</button>" +
+          "<button class='mai-btn' id='mai-visited-range' type='button' style='width:100%;margin-top:6px'>記録済みの問数を範囲に設定</button>" +
+          "<div class='mai-muted'>例：52問目まで記録済みなら、開始1・終了52を入力します。</div>" +
+          "<details style='margin-top:10px'><summary>保管用バックアップ（通常のAnki作成には使わない）</summary>" +
+          "<button class='mai-btn' id='mai-manual-export' type='button' style='width:100%;margin-top:6px'>保存済みデータをバックアップ</button></details>" +
           "<div class='mai-muted' style='margin-top:5px'>演習内の問題ページから取得できます。未演習・取得不足もJSONに保存します。</div>" +
         "</div>" +
         "<div class='mai-card mai-past'><div class='mai-title'>過去の演習</div><div id='mai-history'></div></div>" +
@@ -1882,6 +1906,14 @@
     });
     ui.pageImage.addEventListener("click", addHoveredImage);
     ui.forceAuto.addEventListener("click", toggleAutomaticOverride);
+    panel.querySelector("#mai-visited-range").addEventListener("click", function () {
+      if (!currentSession || exportRunning) return;
+      var positions = currentSession.questionRefs.map(function (ref) { return ref.position; }).filter(function (n) { return Number.isInteger(n) && n > 0; });
+      if (!positions.length) { setStatus("問題ページを一度開いてください", "error"); return; }
+      ui.rangeStart.value = 1;
+      ui.rangeEnd.value = Math.max.apply(null, positions);
+      setStatus("範囲を1〜" + ui.rangeEnd.value + "問目に設定しました。上のAnki作成用JSONを押してください", "info");
+    });
     ui.exportButton.addEventListener("click", exportAllQuestions);
     ui.manualExportButton.addEventListener("click", exportManualBackup);
     ui.drop.addEventListener("dragover", function (event) {
@@ -2201,7 +2233,7 @@
     ui.rangeEnd.disabled = exportRunning;
     ui.exportButton.disabled = exportRunning || !currentSession;
     ui.exportButton.textContent = exportRunning ?
-      "全問取得中…" : "指定範囲／全問＋手動候補を取得";
+      "全問取得中…" : "Anki作成用JSON（問題・解答・手動候補）";
     renderWarnings();
   }
 
