@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.4.1
+// @version      2.4.2
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.4.0";
+  var VERSION = "2.4.2";
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
