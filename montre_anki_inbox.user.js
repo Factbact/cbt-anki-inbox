@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.4.2
+// @version      2.4.3
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.4.2";
+  var VERSION = "2.4.3";
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
@@ -1362,6 +1362,11 @@
     var startUrl = findSessionStartUrl(session);
     if (!startUrl) throw new Error("問題ページを一度開いてから実行してください");
     var results = [];
+    function showProgress() {
+      var total = range ? range.count : session.expectedTotal;
+      var scope = range ? "（" + range.start + "〜" + range.end + "問目）" : "";
+      setStatus("問題取得中 " + results.length + " / " + (total || "?") + "問" + scope, "info");
+    }
     var seenUrls = new Set();
     var seenIds = new Set();
     var queue = [];
@@ -1383,7 +1388,7 @@
       var url = queue.shift();
       if (!url || seenUrls.has(url)) continue;
       seenUrls.add(url);
-      setStatus("問題取得中 " + results.length + " / " + (session.expectedTotal || "?") + "問", "info");
+      showProgress();
       try {
         var liveUrl = new URL(location.href);
         liveUrl.hash = "";
@@ -1401,6 +1406,7 @@
             needsReview: !question.correctAnswer.length || !question.explanation || !question.selfEvaluation
           };
           results.push(question);
+          showProgress();
           state.questionCache[question.problemNumber] = question;
         }
         if (!range || !Number.isInteger(question.position) || question.position > range.start) {
