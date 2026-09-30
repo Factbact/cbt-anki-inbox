@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.2.0
+// @version      2.2.2
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
 // @match        https://www.m3e-medical.com/users/cbt*
+// @match        https://m3e-medical.com/users/montore*
+// @match        https://www.m3e-medical.com/users/montore*
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js
 // @grant        GM_getValue
@@ -21,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.2.0";
+  var VERSION = "2.2.2";
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
@@ -750,7 +752,26 @@
     var pending = state.pendingSessionId ?
       state.sessions.find(function (session) { return session.id === state.pendingSessionId; }) : null;
     if (pending && pending.status !== "completed") {
-      currentSession = pending;
+      var existingFirstRefs = (pending.questionRefs || []).filter(function (ref) {
+        return ref.position === 1;
+      });
+      var sameFirstQuestion = question && question.position === 1 && existingFirstRefs.some(function (ref) {
+        if (question.practiceQuestionId && ref.practiceQuestionId) {
+          return ref.practiceQuestionId === question.practiceQuestionId;
+        }
+        return !question.practiceQuestionId &&
+          question.problemNumber && ref.problemNumber === question.problemNumber;
+      });
+
+      // 「全問再復習」など、検索画面の開始ボタンを通らず新しい演習へ入る場合の保険。
+      // 既存セッションに別の1問目があるのに新しい1問目が表示されたら、
+      // 前回セッションを残したまま新規セッションとして扱う。
+      if (question && question.position === 1 && existingFirstRefs.length && !sameFirstQuestion) {
+        state.pendingSessionId = null;
+        currentSession = null;
+      } else {
+        currentSession = pending;
+      }
     }
 
     if (!currentSession && practiceId) {
@@ -760,12 +781,10 @@
     }
 
     var subjectKey = sessionSubjectKey(context, question ? question.total : options.total);
-    if (!currentSession) {
-      currentSession = state.sessions.find(function (session) {
-        return session.status !== "completed" && session.subjectKey === subjectKey;
-      }) || null;
-    }
 
+    // 別の演習を「科目名＋問題数」だけで再利用しない。
+    // 同じ科目・同じ問題数でも、別日に開始した演習は別セッションとして扱う。
+    // 復帰時は pendingSessionId または既知の practiceQuestionId だけを根拠に再接続する。
     if (!currentSession && options.allowCreate !== false) {
       currentSession = {
         id: makeId("montre-session"),
@@ -1190,6 +1209,7 @@
   }
 
   function captureCurrentQuestion() {
+    if (exportRunning) return;
     currentContext = detectContext(document, location.href);
     currentQuestion = extractQuestion(document, location.href);
     if (!currentQuestion) {
@@ -1242,11 +1262,23 @@
   }
 
   function findSessionStartUrl(session) {
-    var refs = (session.questionRefs || []).slice().sort(function (a, b) {
-      return (a.position || 99999) - (b.position || 99999);
+    var refs = (session.questionRefs || []).slice();
+
+    // 旧版で別演習が同じセッションへ混入した場合、position=1 が複数残ることがある。
+    // その場合は updatedAt が最も新しい1問目を現在の演習の起点として採用する。
+    var firstRefs = refs.filter(function (ref) {
+      return ref.position === 1 && ref.url;
+    }).sort(function (a, b) {
+      return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
     });
-    var first = refs.find(function (ref) { return ref.position === 1; });
-    return first ? first.url : (refs[0] ? refs[0].url : null);
+    if (firstRefs.length) return firstRefs[0].url;
+
+    refs.sort(function (a, b) {
+      var positionDiff = (a.position || 99999) - (b.position || 99999);
+      if (positionDiff) return positionDiff;
+      return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+    });
+    return refs[0] ? refs[0].url : null;
   }
 
   function parseHtml(html) {
@@ -1258,7 +1290,11 @@
   }
 
   async function fetchQuestionPage(url) {
+    var controller = new AbortController();
+    var timeout = setTimeout(function () { controller.abort(); }, 20000);
+    try {
     var response = await fetch(url, {
+      signal: controller.signal,
       method: "GET",
       credentials: "include",
       headers: { "Accept": "text/html,application/xhtml+xml" }
@@ -1266,6 +1302,7 @@
     if (!response.ok) throw new Error("問題ページ取得失敗: HTTP " + response.status);
     var html = await response.text();
     return parseHtml(html);
+    } finally { clearTimeout(timeout); }
   }
 
   function validateExportQuestions(questions, session) {
@@ -1297,33 +1334,51 @@
 
   async function crawlSessionQuestions(session) {
     var startUrl = findSessionStartUrl(session);
-    if (!startUrl) throw new Error("1問目のURLがありません。1問目を一度開いてください");
-    var expected = Number(session.expectedTotal || 0);
+    if (!startUrl) throw new Error("問題ページを一度開いてから実行してください");
     var results = [];
     var seenUrls = new Set();
-    var url = startUrl;
-    var safetyLimit = expected ? expected + 5 : 500;
-
-    while (url && results.length < safetyLimit) {
-      if (seenUrls.has(url)) break;
-      seenUrls.add(url);
-      setStatus("全問取得中 " + (results.length + 1) + " / " + (expected || "?") + "問", "info");
-      var doc = await fetchQuestionPage(url);
-      var question = extractQuestion(doc, url);
-      if (!question) throw new Error((results.length + 1) + "問目の問題番号を取得できません");
-      results.push(question);
-      state.questionCache[question.problemNumber] = question;
-      ensureSession(question, {
-        division: question.subjectContext ? question.subjectContext.division : session.division,
-        subject: question.subjectContext ? question.subjectContext.subject : session.subject,
-        source: question.subjectContext ? question.subjectContext.acquisitionSource : session.subjectSource
-      }, { allowCreate: false });
-      if (expected && results.length >= expected) break;
-      var nextUrl = question.nextQuestionUrl;
-      if (!nextUrl || seenUrls.has(nextUrl)) break;
-      url = nextUrl;
-      await sleep(140);
+    var seenIds = new Set();
+    var queue = [startUrl].concat((session.questionRefs || []).map(function (ref) { return ref.url; }));
+    var failures = [];
+    var limit = Math.max(Number(session.expectedTotal || 0) * 2 + 10, 500);
+    function enqueue(value) {
+      if (!value) return;
+      var parsed;
+      try { parsed = new URL(value, location.href); } catch (_error) { return; }
+      if (parsed.origin !== location.origin || !/\/practice_questions\/\d+/.test(parsed.pathname)) return;
+      parsed.hash = "";
+      if (!seenUrls.has(parsed.href) && queue.indexOf(parsed.href) < 0) queue.push(parsed.href);
     }
+    while (queue.length && seenUrls.size < limit) {
+      var url = queue.shift();
+      if (!url || seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      setStatus("問題取得中 " + results.length + " / " + (session.expectedTotal || "?") + "問", "info");
+      try {
+        var doc = url === location.href ? document : await fetchQuestionPage(url);
+        var question = extractQuestion(doc, url);
+        if (!question) throw new Error("問題番号を取得できません（ログイン状態・ページ形式を確認）");
+        if (!seenIds.has(question.problemNumber)) {
+          seenIds.add(question.problemNumber);
+          question.acquisition = {
+            answerAvailable: Boolean(question.correctAnswer && question.correctAnswer.length),
+            explanationAvailable: Boolean(question.explanation),
+            evaluationAvailable: Boolean(question.selfEvaluation),
+            needsReview: !question.correctAnswer.length || !question.explanation || !question.selfEvaluation
+          };
+          results.push(question);
+          state.questionCache[question.problemNumber] = question;
+        }
+        enqueue(question.previousQuestionUrl);
+        enqueue(question.nextQuestionUrl);
+      } catch (error) {
+        failures.push({ url: url, message: error.message || String(error) });
+      }
+      if (queue.length) await sleep(140);
+    }
+    if (queue.length) failures.push({ message: "取得上限に到達したため巡回を停止しました" });
+    results.sort(function (a, b) { return (a.position || 99999) - (b.position || 99999); });
+    results.acquisitionFailures = failures;
     saveState(true);
     return results;
   }
@@ -1466,13 +1521,19 @@
     exportRunning = true;
     render();
     try {
-      var questions = await crawlSessionQuestions(currentSession);
-      var errors = validateExportQuestions(questions, currentSession);
-      if (errors.length) {
-        var preview = errors.slice(0, 5).join("／");
-        throw new Error(preview + (errors.length > 5 ? " ほか" + (errors.length - 5) + "件" : ""));
-      }
-      var payload = buildExportPayload(currentSession, questions);
+      var session = currentSession;
+      var questions = await crawlSessionQuestions(session);
+      var errors = validateExportQuestions(questions, session);
+      var failures = questions.acquisitionFailures || [];
+      var payload = buildExportPayload(session, questions);
+      payload.exportValidation = {
+        complete: errors.length === 0 && failures.length === 0,
+        warnings: errors,
+        acquisitionFailures: failures,
+        note: "未演習・取得不足も保存。空欄の正答・解説・自己評価は推測して補完しない。"
+      };
+      payload.exerciseSession.status = payload.exportValidation.complete ? "completed" : "partial";
+      payload.exerciseSession.completedAt = payload.exportValidation.complete ? nowIso() : null;
       var safeSubject = (currentSession.division + "_" + currentSession.subject)
         .replace(/[\\/:*?"<>|\s]+/g, "_");
       var fileName = "montre_anki_" + safeSubject + "_" +
@@ -1482,13 +1543,15 @@
       activeCandidatesForSession(currentSession.id).forEach(function (candidate) {
         if (!candidate.exportedAt) candidate.exportedAt = exportedAt;
       });
-      currentSession.status = "completed";
-      currentSession.completedAt = exportedAt;
+      currentSession.status = payload.exerciseSession.status;
+      currentSession.completedAt = payload.exerciseSession.completedAt;
       currentSession.exportedAt = exportedAt;
       currentSession.exportedFileName = fileName;
-      state.pendingSessionId = null;
+      state.pendingSessionId = payload.exportValidation.complete ? null : currentSession.id;
       saveState(true);
-      setStatus("全" + questions.length + "問と手動候補のJSONを保存しました", "success");
+      setStatus(questions.length + "問と手動候補のJSONを保存しました" +
+        (payload.exportValidation.complete ? "" : "（取得不足あり。JSON内のexportValidationを確認）"),
+        payload.exportValidation.complete ? "success" : "info");
     } catch (error) {
       setStatus("JSON取得を完了できません: " + (error.message || String(error)), "error");
     } finally {
@@ -1556,23 +1619,26 @@
       setStatus("⚠ 分類を自動取得できません。先に手動設定してください", "error");
       return false;
     }
+
+    // 「演習を始める」を押した時点で必ず新しいセッションを作る。
+    // 以前の未完了セッションや手動候補は履歴として残し、混ぜない。
     currentSession = null;
-    var subjectKey = sessionSubjectKey(context, total);
-    var reusable = state.sessions.find(function (session) {
-      return session.status !== "completed" && session.subjectKey === subjectKey;
+    var previousPendingSessionId = state.pendingSessionId;
+    state.pendingSessionId = null;
+    ensureSession(null, context, {
+      allowCreate: true,
+      total: total,
+      startedAt: nowIso(),
+      searchUrl: location.href
     });
-    if (reusable) {
-      currentSession = reusable;
-    } else {
-      ensureSession(null, context, {
-        allowCreate: true,
-        total: total,
-        startedAt: nowIso(),
-        searchUrl: location.href
-      });
+    if (!currentSession) {
+      state.pendingSessionId = previousPendingSessionId;
+      setStatus("新しい演習セッションを作成できません", "error");
+      return false;
     }
+
     state.pendingContext = Object.assign({}, context, { capturedAt: nowIso() });
-    state.pendingSessionId = currentSession ? currentSession.id : null;
+    state.pendingSessionId = currentSession.id;
     saveState(true);
     return true;
   }
@@ -1721,7 +1787,7 @@
         "<div class='mai-card'>" +
           "<button class='mai-btn primary' id='mai-export' type='button' style='width:100%'>モントレ全問＋手動候補を取得</button>" +
           "<button class='mai-btn' id='mai-manual-export' type='button' style='width:100%;margin-top:6px'>手動候補バックアップJSON</button>" +
-          "<div class='mai-muted' style='margin-top:5px'>全問再復習で1問目を開いてから実行してください。</div>" +
+          "<div class='mai-muted' style='margin-top:5px'>演習内の問題ページから取得できます。未演習・取得不足もJSONに保存します。</div>" +
         "</div>" +
         "<div class='mai-card mai-past'><div class='mai-title'>過去の演習</div><div id='mai-history'></div></div>" +
       "</div>" +
