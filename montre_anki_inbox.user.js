@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.3.1
+// @version      2.4.0
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.3.1";
+  var VERSION = "2.4.0";
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
@@ -447,21 +447,29 @@
   }
 
   function parseAnswerLetters(value) {
-    var letters = String(value || "").toUpperCase().match(/[A-E]/g) || [];
+    var letters = String(value || "").normalize("NFKC").toUpperCase().match(/[A-Z]/g) || [];
     return Array.from(new Set(letters)).sort();
   }
 
+  function correctAnswerFromText(value) {
+    var text = String(value || "").normalize("NFKC");
+    // 解説の「正解 Cポイント」のように行が連結された表記にも対応。
+    var matches = Array.from(text.matchAll(/正解\s*[:：]?\s*([A-Z](?:\s*[,、・，]\s*[A-Z])*)(?![A-Za-z])/gu));
+    var answers = matches.map(function (match) { return parseAnswerLetters(match[1]); });
+    var unique = Array.from(new Set(answers.map(function (answer) { return answer.join(","); })));
+    return unique.length === 1 ? answers[0] : [];
+  }
+
   function parseCorrectAnswer(doc) {
-    var text = getDocumentText(doc);
-    var match = text.match(/(?:^|\n)正解\s*[:：]?\s*([A-E](?:\s*[,、・]\s*[A-E])*)/u);
-    return match ? parseAnswerLetters(match[1]) : [];
+    var fromExplanation = correctAnswerFromText(parseExplanation(doc));
+    return fromExplanation.length ? fromExplanation : correctAnswerFromText(getDocumentText(doc));
   }
 
   function parseLatestAnswer(doc) {
-    var text = getDocumentText(doc);
+    var text = getDocumentText(doc).normalize("NFKC");
     var historyIndex = text.indexOf("解答履歴");
     var historyText = historyIndex >= 0 ? text.slice(historyIndex) : text;
-    var matches = Array.from(historyText.matchAll(/解答\s*[:：]\s*([A-E](?:\s*[,、・]\s*[A-E])*)/gu));
+    var matches = Array.from(historyText.matchAll(/解答\s*[:：]\s*([A-Z](?:\s*[,、・]\s*[A-Z])*)/gu));
     if (matches.length) return parseAnswerLetters(matches[0][1]);
     var selected = parseChoices(doc).filter(function (choice) { return choice.selected; }).map(function (choice) { return choice.label; });
     return selected.sort();
@@ -475,12 +483,17 @@
   function parseEvaluation(doc, correctAnswer, selectedAnswer) {
     var changeButton = doc.querySelector("#change-answer-button");
     var changeText = oneLine(elementText(changeButton));
+    var explicitMatches = Array.from(getDocumentText(doc).matchAll(/自己評価\s*[:：]\s*([△○◎×])/gu));
+    var explicitValues = Array.from(new Set(explicitMatches.map(function (match) { return match[1]; })));
     var hint = doc.querySelector("#hint-used");
     var hintUsed = Boolean(hint && (
       hint.value === "true" ||
       hint.getAttribute("data-hint-used") === "true"
     ));
 
+    if (explicitValues.length === 1) {
+      return { value: explicitValues[0], raw: "explicit", hintUsed: hintUsed, source: "explicit-self-evaluation-label", changeButtonText: changeText };
+    }
     if (changeButton && !/△に変更/u.test(changeText) &&
       /○に変更|×に変更|元に戻|△を解除/u.test(changeText)) {
       return { value: "△", raw: "mistake", hintUsed: hintUsed, source: "change-answer-button", changeButtonText: changeText };
@@ -592,6 +605,10 @@
       correctAnswer: correctAnswer,
       explanation: parseExplanation(doc),
       images: collectQuestionImages(doc, urlValue),
+      answerCorrectness: correctAnswer.length && selectedAnswer.length ?
+        (sameLetters(correctAnswer, selectedAnswer) ? "correct" : "incorrect") : "unknown",
+      observedSelfEvaluation: evaluation.source === "explicit-self-evaluation-label" || evaluation.source === "change-answer-button" ? evaluation.value : null,
+      selfEvaluationConfirmed: evaluation.source === "explicit-self-evaluation-label" || evaluation.source === "change-answer-button",
       selfEvaluation: evaluation.value,
       selfEvaluationRaw: evaluation.raw,
       hintUsed: evaluation.hintUsed,
@@ -1459,6 +1476,7 @@
         completedAt: nowIso(),
         expectedTotal: session.expectedTotal,
         acquiredTotal: questions.length,
+        studyCheckpoint: session.studyCheckpoint || null,
         searchUrl: session.searchUrl,
         selectionClassification: sessionClassification,
         status: "completed"
@@ -1528,6 +1546,38 @@
     setStatus("保管用バックアップを保存しました。Anki作成には上の「Anki作成用JSON」を押してください", "info");
   }
 
+  function checkpointSummary(session) {
+    var point = session && session.studyCheckpoint;
+    if (!point) return "区切りは未記録";
+    var next = session.expectedTotal && point.position >= session.expectedTotal ?
+      "最終問まで記録" : "次回開始目安：" + (point.position + 1) + "問目";
+    return "区切り：" + point.position + "問目 ／ " + next +
+      " ／ データ確認済み：" + (session.verifiedExportThrough || 0) + "問目まで";
+  }
+
+  async function recordCheckpointAndExport() {
+    if (exportRunning) return;
+    captureCurrentQuestion();
+    var session = currentSession, question = currentQuestion;
+    if (!session || !question || !Number.isInteger(question.position) || question.position < 1) {
+      setStatus("問題ページを開いてから押してください", "error");
+      return;
+    }
+    var through = Number(session.verifiedExportThrough || 0);
+    var end = question.position;
+    var start = through < end ? through + 1 : 1;
+    session.studyCheckpoint = {
+      position: Math.max(end, Number(session.studyCheckpoint && session.studyCheckpoint.position || 0)),
+      clickedPosition: end, problemNumber: question.problemNumber,
+      url: question.url, recordedAt: nowIso(), source: "user_checkpoint_button"
+    };
+    saveState(true);
+    ui.rangeStart.value = start;
+    ui.rangeEnd.value = end;
+    render();
+    await exportAllQuestions();
+  }
+
   function parseExportRange(startValue, endValue, total) {
     var first = String(startValue || "").trim();
     var last = String(endValue || "").trim();
@@ -1594,6 +1644,7 @@
       var contentCount = questions.filter(function (q) { return q.questionText && q.choices && q.choices.length; }).length;
       payload.exportValidation = {
         questionsWithTextAndChoices: contentCount,
+        selfEvaluationUnconfirmed: questions.filter(function (q) { return !q.selfEvaluationConfirmed; }).map(function (q) { return q.position; }),
         complete: errors.length === 0 && failures.length === 0,
         warnings: errors,
         acquisitionFailures: failures,
@@ -1615,6 +1666,28 @@
       currentSession.completedAt = payload.exerciseSession.completedAt;
       currentSession.exportedAt = exportedAt;
       currentSession.exportedFileName = fileName;
+      var exportStart = range ? range.start : 1;
+      var exportEnd = range ? range.end : Number(session.expectedTotal || 0);
+      if (!Array.isArray(session.exportHistory)) session.exportHistory = [];
+      var dataComplete = failures.length === 0 && questions.length === (range ? range.count : session.expectedTotal) &&
+        questions.every(function (q) { return q.questionText && q.choices.length && q.correctAnswer.length && q.explanation; }) &&
+        (!range || missingPositions.length === 0);
+      session.exportHistory.push({
+        start: exportStart, end: exportEnd, acquiredTotal: questions.length,
+        complete: payload.exportValidation.complete, dataComplete: dataComplete, fileName: fileName, exportedAt: exportedAt
+      });
+      // 不足ありの出力を飛ばして次の範囲へ進めない。
+      var through = Number(session.verifiedExportThrough || 0);
+      var advanced = true;
+      while (advanced) {
+        advanced = false;
+        session.exportHistory.forEach(function (entry) {
+          if ((entry.dataComplete || entry.complete) && entry.start <= through + 1 && entry.end > through) {
+            through = entry.end; advanced = true;
+          }
+        });
+      }
+      session.verifiedExportThrough = through;
       state.pendingSessionId = !range && payload.exportValidation.complete ? null : currentSession.id;
       saveState(true);
       setStatus(questions.length + "問を出力／問題文・選択肢あり " + contentCount + "問" +
@@ -1853,7 +1926,11 @@
           "<div id='mai-candidates'></div>" +
         "</div>" +
         "<div class='mai-card'>" +
-          "<div class='mai-title'>JSON取得範囲</div>" +
+          "<div class='mai-title'>途中の区切りを記録</div>" +
+          "<div id='mai-checkpoint-info' class='mai-muted' style='margin-bottom:6px'></div>" +
+          "<button class='mai-btn primary' id='mai-checkpoint-export' type='button' style='width:100%;margin-bottom:6px'>ここまで記録してJSON取得</button>" +
+          "<div class='mai-muted' style='margin-bottom:10px'>表示中の問題までを取得。初回は1問目から、次回はデータ確認済みの続きから。未回答でも押した位置を区切りとして記録します。</div>" +
+          "<div class='mai-title'>JSON取得範囲（手動指定）</div>" +
           "<div class='mai-row' style='margin-bottom:6px'>" +
           "<label style='flex:1'>開始（問目）<input class='mai-input' id='mai-range-start' type='number' min='1' step='1' placeholder='例：20'></label>" +
           "<label style='flex:1'>終了（問目）<input class='mai-input' id='mai-range-end' type='number' min='1' step='1' placeholder='例：40'></label></div>" +
@@ -1884,6 +1961,9 @@
     ui.forceAuto = panel.querySelector("#mai-force-auto");
     ui.subjectFallback = panel.querySelector("#mai-subject-fallback");
     ui.candidates = panel.querySelector("#mai-candidates");
+    ui.checkpointInfo = panel.querySelector("#mai-checkpoint-info");
+    ui.checkpointExport = panel.querySelector("#mai-checkpoint-export");
+    ui.checkpointExport.addEventListener("click", recordCheckpointAndExport);
     ui.rangeStart = panel.querySelector("#mai-range-start");
     ui.rangeEnd = panel.querySelector("#mai-range-end");
     ui.exportButton = panel.querySelector("#mai-export");
@@ -2189,6 +2269,12 @@
         "｜" + formatShortDate(session.startedAt) +
         "｜" + candidates.length + "件｜" +
         (session.status === "completed" ? "完了" : (pending ? "未書き出し" + pending : "未完了"));
+      var checkpointDetails = "<div class='mai-muted'>" + escapeHtml(checkpointSummary(session)) + "</div>" +
+        (session.exportHistory || []).map(function (entry) {
+          return "<div class='mai-muted'>" + escapeHtml(formatShortDate(entry.exportedAt)) + "｜" +
+            entry.start + "〜" + entry.end + "問目｜" + entry.acquiredTotal + "問出力｜" +
+            ((entry.dataComplete || entry.complete) ? "問題・正答・解説取得済み" : "不足あり・再取得対象") + "</div>";
+        }).join("");
       var details = candidates.map(function (candidate) {
         return "<div class='mai-candidate'>" +
           escapeHtml(candidate.text || ("画像" + candidate.images.length + "枚")) +
@@ -2196,7 +2282,9 @@
           "<button class='mai-btn danger' type='button' data-delete-candidate='" +
             escapeHtml(candidate.id) + "'>削除</button></div>";
       }).join("") || "<div class='mai-muted'>候補なし</div>";
-      return "<details><summary>" + escapeHtml(label) + "</summary>" + details + "</details>";
+      return "<details><summary>" + escapeHtml(label) +
+        (session.studyCheckpoint ? "｜区切り" + session.studyCheckpoint.position + "問目" : "") +
+        "</summary>" + checkpointDetails + details + "</details>";
     }).join("");
   }
 
@@ -2229,6 +2317,8 @@
     renderSubjectFallback();
     renderCandidates();
     renderHistory();
+    ui.checkpointInfo.textContent = checkpointSummary(currentSession);
+    ui.checkpointExport.disabled = exportRunning || !currentQuestion || !currentSession;
     ui.rangeStart.disabled = exportRunning;
     ui.rangeEnd.disabled = exportRunning;
     ui.exportButton.disabled = exportRunning || !currentSession;
