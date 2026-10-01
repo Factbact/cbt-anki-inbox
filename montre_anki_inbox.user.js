@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.4.3
+// @version      2.5.0
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.4.3";
+  var VERSION = "2.5.0";
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
@@ -360,7 +360,6 @@
   function getDocumentText(doc) {
     var body = doc && doc.body;
     if (!body) return "";
-    if (body.innerText) return normalizeText(body.innerText);
     // DOMParserで取得したHTMLでもブロック境界を保ち、正答・問題文の行を検出する。
     var clone = body.cloneNode(true);
     Array.prototype.forEach.call(clone.querySelectorAll("script,style,noscript,#montre-anki-panel,#montre-anki-toggle"), function (el) { el.remove(); });
@@ -460,8 +459,39 @@
     return unique.length === 1 ? answers[0] : [];
   }
 
+  function parseQuestionGroup(doc) {
+    var match = getDocumentText(doc).match(/連問\s*(\d+)\s*\/\s*(\d+)\s*問目/u);
+    if (!match) return null;
+    var index = Number(match[1]), count = Number(match[2]);
+    return index >= 1 && count >= index && count > 1 ? { index: index, count: count } : null;
+  }
+
+  function explanationForChoices(explanation, choices, group) {
+    var text = String(explanation || "");
+    var sections = text.split(/(?=[［\[]\d+[］\]]\s*Assessment\s*[:：])/u)
+      .filter(function (part) { return /^[［\[]\d+[］\]]/u.test(part); });
+    if (sections.length < 2) return text;
+    if (group) {
+      var numbers = sections.map(function (section) { return Number(section.match(/^[［\[]([0-9]+)[］\]]/u)[1]); });
+      if (sections.length !== group.count || !numbers.every(function (n, i) { return n === i + 1; })) return "";
+      return sections[group.index - 1];
+    }
+    // 連問の先頭の正答を流用しない。全選択肢の文言が一致する節だけを採用する。
+    var compact = function (value) { return String(value || "").normalize("NFKC").replace(/\s+/gu, ""); };
+    var usable = (choices || []).filter(function (choice) { return compact(choice.text).length >= 2; });
+    if (usable.length < 2) return "";
+    var matching = sections.filter(function (section) {
+      var body = compact(section);
+      return usable.every(function (choice) { return body.indexOf(compact(choice.text)) >= 0; });
+    });
+    return matching.length === 1 ? matching[0] : "";
+  }
+
   function parseCorrectAnswer(doc) {
-    var fromExplanation = correctAnswerFromText(parseExplanation(doc));
+    var full = parseExplanation(doc);
+    var scoped = explanationForChoices(full, parseChoices(doc), parseQuestionGroup(doc));
+    if (full && !scoped) return [];
+    var fromExplanation = correctAnswerFromText(scoped);
     return fromExplanation.length ? fromExplanation : correctAnswerFromText(getDocumentText(doc));
   }
 
@@ -587,6 +617,7 @@
       url: String(urlValue || ""),
       position: position.current,
       total: position.total,
+      questionGroup: parseQuestionGroup(doc),
       subjectContext: context ? {
         largeCategory: context.division,
         category: context.subject,
@@ -603,7 +634,7 @@
       choices: parseChoices(doc),
       selectedAnswer: selectedAnswer,
       correctAnswer: correctAnswer,
-      explanation: parseExplanation(doc),
+      explanation: explanationForChoices(parseExplanation(doc), parseChoices(doc), parseQuestionGroup(doc)),
       images: collectQuestionImages(doc, urlValue),
       answerCorrectness: correctAnswer.length && selectedAnswer.length ?
         (sameLetters(correctAnswer, selectedAnswer) ? "correct" : "incorrect") : "unknown",
@@ -618,6 +649,73 @@
       previousQuestionUrl: findPreviousQuestionUrl(doc, urlValue),
       capturedAt: nowIso()
     };
+  }
+
+  function extractQuestionsFromPage(doc, urlValue) {
+    var markers = Array.from(doc.querySelectorAll("body *")).filter(function (element) {
+      if (/^(SCRIPT|STYLE|NOSCRIPT)$/.test(element.tagName) || element.closest("#montre-anki-panel")) return false;
+      var text = element.textContent || "";
+      if (!/問題番号\s*[:：]\s*\d{6,12}/u.test(text)) return false;
+      return !Array.from(element.children).some(function (child) {
+        return /問題番号\s*[:：]\s*\d{6,12}/u.test(child.textContent || "");
+      });
+    });
+    var ids = Array.from(new Set(markers.map(function (element) {
+      return (element.textContent.match(/問題番号\s*[:：]\s*(\d{6,12})/u) || [])[1];
+    }).filter(Boolean)));
+    if (ids.length < 2) {
+      var single = extractQuestion(doc, urlValue);
+      return single ? [single] : [];
+    }
+    var pagePosition = parseQuestionPosition(doc);
+    var sharedExplanation = parseExplanation(doc);
+    var group = [];
+    ids.forEach(function (id, index) {
+      var marker = markers.find(function (element) {
+        return new RegExp("問題番号\\s*[:：]\\s*" + id + "(?!\\d)").test(element.textContent);
+      });
+      var scope = marker;
+      while (scope && scope.parentElement && scope.parentElement !== doc.body) {
+        var parent = scope.parentElement;
+        var parentIds = Array.from(new Set(Array.from((parent.textContent || "").matchAll(/問題番号\s*[:：]\s*(\d{6,12})/gu)).map(function (m) { return m[1]; })));
+        if (parentIds.length !== 1 || parentIds[0] !== id) break;
+        scope = parent;
+      }
+      if (!scope || !scope.querySelector("button[data-id]")) return;
+      var scopedDoc = doc.implementation.createHTMLDocument("");
+      scopedDoc.body.appendChild(scope.cloneNode(true));
+      var localExplanation = parseExplanation(scopedDoc);
+      if (!localExplanation && sharedExplanation) {
+        var explanationNode = scopedDoc.createElement("div");
+        explanationNode.id = "practice_question_accordion_expound";
+        explanationNode.textContent = sharedExplanation;
+        scopedDoc.body.appendChild(explanationNode);
+      }
+      var question = extractQuestion(scopedDoc, urlValue);
+      if (!question || question.problemNumber !== id) return;
+      // 問題本文のDOM順とページ内の連問数に対応する解説節がそろう場合のみ位置を補う。
+      if (!question.position && pagePosition.current) {
+        var sectionNumbers = Array.from(sharedExplanation.matchAll(/[［\[]([0-9]+)[］\]]\s*Assessment\s*[:：]/gu)).map(function (m) { return Number(m[1]); });
+        if (sectionNumbers.length === ids.length && sectionNumbers.every(function (n, i) { return n === i + 1; })) {
+          question.position = pagePosition.current + index;
+          question.positionSource = "page-start-and-ordered-group";
+        }
+      }
+      question.total = question.total || pagePosition.total;
+      var context = extractQuestion(doc, urlValue);
+      if (!question.subjectContext && context) {
+        question.subjectContext = context.subjectContext;
+        question.classification = context.classification;
+        question.ankiTags = context.ankiTags;
+      }
+      question.pageGroup = { sourceUrl: urlValue, index: index + 1, count: ids.length };
+      // 同じページ内の小問に架空のpracticeQuestionIdを付けない。
+      question.practiceQuestionId = index === 0 ? question.practiceQuestionId : null;
+      question.nextQuestionUrl = findNextQuestionUrl(doc, urlValue);
+      question.previousQuestionUrl = findPreviousQuestionUrl(doc, urlValue);
+      group.push(question);
+    });
+    return group;
   }
 
   function sessionSubjectKey(context, total) {
@@ -1338,12 +1436,16 @@
       errors.push("予定" + session.expectedTotal + "問に対して" + questions.length + "問しか取得できませんでした");
     }
     var ids = new Set();
+    var positions = new Set();
     questions.forEach(function (question) {
       if (!question.problemNumber) errors.push("問題番号なし");
       if (question.problemNumber && ids.has(question.problemNumber)) {
         errors.push("問題番号" + question.problemNumber + "が重複");
       }
       ids.add(question.problemNumber);
+      if (!Number.isInteger(question.position) || question.position < 1) errors.push("問題" + question.problemNumber + "の問目が不明");
+      else if (positions.has(question.position)) errors.push(question.position + "問目が重複");
+      positions.add(question.position);
       if (!question.subjectContext || !question.subjectContext.division || !question.subjectContext.subject) {
         errors.push("問題" + (question.problemNumber || "?") + "の科目なし");
       }
@@ -1356,6 +1458,27 @@
       if (!question.selfEvaluation) errors.push("問題" + (question.problemNumber || "?") + "の自己評価なし");
     });
     return Array.from(new Set(errors));
+  }
+
+  function groupRecoveryCandidates(question) {
+    var group = question.questionGroup;
+    if (!group || !Number.isInteger(question.position) || !question.nextQuestionUrl) return [];
+    var current = new URL(question.url), next = new URL(question.nextQuestionUrl, question.url);
+    // Only use numeric IDs from the two surrounding page URLs, never infer problem numbers.
+    var firstId = current.pathname.match(/\/practice_questions\/(\d+)$/);
+    var nextId = next.pathname.match(/\/practice_questions\/(\d+)$/);
+    var remaining = group.count - group.index;
+    if (!firstId || !nextId || current.origin !== next.origin || remaining < 1 ||
+        Number(nextId[1]) - Number(firstId[1]) !== remaining + 1) return [];
+    var candidates = [];
+    for (var offset = 1; offset <= remaining; offset += 1) {
+      var candidate = new URL(current.href);
+      candidate.pathname = current.pathname.replace(/\d+$/, String(Number(firstId[1]) + offset));
+      candidate.hash = "";
+      candidates.push({ url: candidate.href, position: question.position + offset,
+        total: question.total, groupIndex: group.index + offset, groupCount: group.count });
+    }
+    return candidates;
   }
 
   async function crawlSessionQuestions(session, range) {
@@ -1371,6 +1494,8 @@
     var seenIds = new Set();
     var queue = [];
     var failures = [];
+    var recoveries = new Map();
+    var attempts = new Map();
     var limit = Math.max(Number(session.expectedTotal || 0) * 2 + 10, 500);
     function enqueue(value) {
       if (!value) return;
@@ -1393,31 +1518,60 @@
         var liveUrl = new URL(location.href);
         liveUrl.hash = "";
         var doc = url === liveUrl.href ? document : await fetchQuestionPage(url);
-        var question = extractQuestion(doc, url);
-        if (!question) throw new Error("問題番号を取得できません（ログイン状態・ページ形式を確認）");
-        var inRange = !range || (Number.isInteger(question.position) &&
-          question.position >= range.start && question.position <= range.end);
-        if (inRange && !seenIds.has(question.problemNumber)) {
-          seenIds.add(question.problemNumber);
-          question.acquisition = {
-            answerAvailable: Boolean(question.correctAnswer && question.correctAnswer.length),
-            explanationAvailable: Boolean(question.explanation),
-            evaluationAvailable: Boolean(question.selfEvaluation),
-            needsReview: !question.correctAnswer.length || !question.explanation || !question.selfEvaluation
-          };
-          results.push(question);
-          showProgress();
-          state.questionCache[question.problemNumber] = question;
+        var pageQuestions = extractQuestionsFromPage(doc, url);
+        if (!pageQuestions.length) throw new Error("問題を抽出できません（ログイン状態・連問のページ形式を確認）");
+        var expectedRecovery = recoveries.get(url);
+        if (expectedRecovery && !pageQuestions.some(function (q) {
+          return q.position === expectedRecovery.position && q.total === expectedRecovery.total &&
+            q.questionGroup && q.questionGroup.index === expectedRecovery.groupIndex &&
+            q.questionGroup.count === expectedRecovery.groupCount;
+        })) {
+          throw new Error("連問" + expectedRecovery.position + "問目への読取が別の問題に戻されました。欠落のまま明示します");
         }
-        if (!range || !Number.isInteger(question.position) || question.position > range.start) {
-          enqueue(question.previousQuestionUrl);
-        }
-        if (!range || !Number.isInteger(question.position) || question.position < range.end) {
-          enqueue(question.nextQuestionUrl);
-        }
+        pageQuestions.forEach(function (question) {
+          groupRecoveryCandidates(question).forEach(function (candidate) {
+            if (range && (candidate.position < range.start || candidate.position > range.end)) return;
+            if (!results.some(function (q) { return q.position === candidate.position; })) {
+              recoveries.set(candidate.url, candidate);
+              enqueue(candidate.url);
+            }
+          });
+          var inRange = !range || (Number.isInteger(question.position) &&
+            question.position >= range.start && question.position <= range.end);
+          if (inRange && !seenIds.has(question.problemNumber)) {
+            seenIds.add(question.problemNumber);
+            question.acquisition = {
+              answerAvailable: Boolean(question.correctAnswer && question.correctAnswer.length),
+              explanationAvailable: Boolean(question.explanation),
+              evaluationAvailable: Boolean(question.selfEvaluation),
+              needsReview: !question.correctAnswer.length || !question.explanation || !question.selfEvaluation
+            };
+            results.push(question);
+            showProgress();
+            state.questionCache[question.problemNumber] = question;
+          }
+          if (!range || !Number.isInteger(question.position) || question.position > range.start) enqueue(question.previousQuestionUrl);
+          if (!range || !Number.isInteger(question.position) || question.position < range.end) enqueue(question.nextQuestionUrl);
+        });
+        // 連問や問題一覧への実在リンクも拾う。URLの数値を推測して生成しない。
+        Array.from(doc.querySelectorAll("a[href*='/practice_questions/']")).forEach(function (anchor) {
+          var label = oneLine(elementText(anchor));
+          var positionMatch = label.match(/^(?:第)?(\d+)\s*問目?$/u);
+          if (!range || (positionMatch && Number(positionMatch[1]) >= range.start && Number(positionMatch[1]) <= range.end)) {
+            enqueue(absoluteUrl(anchor.getAttribute("href"), url));
+          }
+        });
         if (range && results.length === range.count) break;
       } catch (error) {
-        failures.push({ url: url, message: error.message || String(error) });
+        var tried = (attempts.get(url) || 0) + 1;
+        attempts.set(url, tried);
+        if (tried < 2 && !recoveries.has(url)) {
+          seenUrls.delete(url);
+          queue.push(url);
+        } else {
+          failures.push({ url: url, position: recoveries.has(url) ? recoveries.get(url).position : null,
+            message: error.message || String(error) });
+        }
       }
       if (queue.length) await sleep(140);
     }
@@ -1632,12 +1786,12 @@
       var errors = validateExportQuestions(questions,
         range ? Object.assign({}, session, { expectedTotal: range.count }) : session);
       var missingPositions = [];
-      if (range) {
+      if (range || session.expectedTotal) {
         var positions = new Set(questions.map(function (q) { return q.position; }));
-        for (var position = range.start; position <= range.end; position += 1) {
+        for (var position = range ? range.start : 1; position <= (range ? range.end : session.expectedTotal); position += 1) {
           if (!positions.has(position)) missingPositions.push(position);
         }
-        if (missingPositions.length) errors.push("指定範囲内の未取得位置: " + missingPositions.join(", "));
+        if (missingPositions.length) errors.push("未取得の問目: " + missingPositions.join(", "));
       }
       var failures = questions.acquisitionFailures || [];
       var payload = buildExportPayload(session, questions, range);
@@ -1645,10 +1799,11 @@
         mode: "range", start: range.start, end: range.end,
         expectedTotal: range.count, acquiredTotal: questions.length,
         missingPositions: missingPositions
-      } : { mode: "all", expectedTotal: session.expectedTotal, acquiredTotal: questions.length };
+      } : { mode: "all", expectedTotal: session.expectedTotal, acquiredTotal: questions.length, missingPositions: missingPositions };
       payload.exportType = "anki_questions";
       var contentCount = questions.filter(function (q) { return q.questionText && q.choices && q.choices.length; }).length;
       payload.exportValidation = {
+        missingPositions: missingPositions,
         questionsWithTextAndChoices: contentCount,
         selfEvaluationUnconfirmed: questions.filter(function (q) { return !q.selfEvaluationConfirmed; }).map(function (q) { return q.position; }),
         complete: errors.length === 0 && failures.length === 0,
@@ -1697,7 +1852,8 @@
       state.pendingSessionId = !range && payload.exportValidation.complete ? null : currentSession.id;
       saveState(true);
       setStatus(questions.length + "問を出力／問題文・選択肢あり " + contentCount + "問" +
-        (payload.exportValidation.complete ? "" : "（取得不足あり。JSON内のexportValidationを確認）"),
+        (missingPositions.length ? "（未取得：" + missingPositions.join("・") + "問目）" :
+          payload.exportValidation.complete ? "" : "（正答・解答記録などに不足あり）"),
         payload.exportValidation.complete ? "success" : "info");
     } catch (error) {
       setStatus("JSON取得を完了できません: " + (error.message || String(error)), "error");
