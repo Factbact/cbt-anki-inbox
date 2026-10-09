@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.8.0
-// @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
+// @version      2.9.0
+// @description  Anki追加箱と誤答復習を統合。直近の通常演習の×・△をワンクリック取得。
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
 // @match        https://www.m3e-medical.com/users/cbt*
@@ -23,10 +23,11 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.8.0";
+  var VERSION = "2.9.0";
   var REVIEW_BRIDGE_KEY = "montreReview.bridge.v1";
   var reviewPublished = {};
   var reviewReplayActive = false;
+  var reviewCollectionRunning = false;
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
@@ -1401,6 +1402,8 @@
         selfEvaluationConfirmed: question.selfEvaluationConfirmed === true,
         reviewMarkVerified: true,
         reviewEvaluationSource: evidence.method,
+        reviewExerciseSessionId: question.reviewExerciseSessionId || null,
+        reviewExerciseAt: question.reviewExerciseAt || question.capturedAt || null,
         selfEvaluationRaw: question.selfEvaluationRaw,
         evaluationSource: question.evaluationSource,
         answerCorrectness: question.answerCorrectness,
@@ -1418,23 +1421,24 @@
   function publishReviewQuestion(question, force) {
     try {
       var packet = makeReviewPacket(question);
-      if (!packet) return;
+      if (!packet) return false;
       var fingerprint = JSON.stringify(packet.question);
       var id = packet.question.problemNumber;
-      if (!force && reviewPublished[id] === fingerprint) return;
-      reviewPublished[id] = fingerprint;
+      if (!force && reviewPublished[id] === fingerprint) return false;
       var payload = JSON.stringify(packet);
-      if (payload.length > 240000) return;
-      // ロード順が異なるときのために最後の1問のみ一時保管する。
+      if (payload.length > 240000) return false;
       try { localStorage.setItem(REVIEW_BRIDGE_KEY, payload); } catch (_err) {}
       if (typeof window.__montreReviewIntegratedIngest === "function") {
         window.__montreReviewIntegratedIngest(payload);
-        return;
+      } else {
+        window.dispatchEvent(new CustomEvent("montre-review:question", { detail: payload }));
+        window.postMessage(payload, location.origin);
       }
-      window.dispatchEvent(new CustomEvent("montre-review:question", { detail: payload }));
-      window.postMessage(payload, location.origin);
+      reviewPublished[id] = fingerprint;
+      return true;
     } catch (_error) {
-      // 復習連携が失敗してもAnki用問題取得を止めない。
+      // 復習連携の失敗がAnki本体へ波及しないようにする。
+      return false;
     }
   }
 
@@ -1483,6 +1487,8 @@
 
   function installReviewBridge() {
     window.__montreReviewIntegratedRequest = replayReviewCache;
+    window.__montreReviewIntegratedLatestSession = latestReviewExercisePreview;
+    window.__montreReviewIntegratedImportLatest = collectLatestExerciseForReview;
     window.addEventListener("montre-review:sync-request", replayReviewCache);
     window.addEventListener("message", function (event) {
       if (event.source !== window || event.origin !== location.origin ||
@@ -1546,6 +1552,10 @@
     }
     currentSession = null;
     ensureSession(currentQuestion, currentContext, { allowCreate: true });
+    if (currentSession) {
+      currentQuestion.reviewExerciseSessionId = currentSession.id;
+      currentQuestion.reviewExerciseAt = currentSession.startedAt || currentQuestion.capturedAt;
+    }
     state.questionCache[currentQuestion.problemNumber] = currentQuestion;
     saveState(false);
     publishReviewQuestion(currentQuestion, false);
@@ -1648,7 +1658,7 @@
     return candidates;
   }
 
-  async function crawlSessionQuestions(session, range) {
+  async function crawlSessionQuestions(session, range, reviewProgress) {
     var startUrl = findSessionStartUrl(session);
     if (!startUrl) throw new Error("問題ページを一度開いてから実行してください");
     var results = [];
@@ -1656,6 +1666,10 @@
       var total = range ? range.count : session.expectedTotal;
       var scope = range ? "（" + range.start + "〜" + range.end + "問目）" : "";
       setStatus("問題取得中 " + results.length + " / " + (total || "?") + "問" + scope, "info");
+      if (typeof reviewProgress === "function") {
+        try { reviewProgress({scanned:results.length,total:Number(total||0),phase:"reading"}); }
+        catch (_error) {}
+      }
     }
     var seenUrls = new Set();
     var seenIds = new Set();
@@ -1747,6 +1761,80 @@
     results.acquisitionFailures = failures;
     saveState(true);
     return results;
+  }
+
+
+  function latestReviewExerciseSession() {
+    var sessions = (state.sessions || []).filter(function (session) {
+      if (!session || !Array.isArray(session.questionRefs) || !session.questionRefs.length) return false;
+      var url = findSessionStartUrl(session);
+      if (!url) return false;
+      try {
+        var u = new URL(url, location.href);
+        return u.origin === location.origin &&
+          /\/users\/cbt\/practice_questions\/\d+/.test(u.pathname);
+      } catch (_error) { return false; }
+    });
+    sessions.sort(function (a,b) {
+      return String(b.startedAt||"").localeCompare(String(a.startedAt||"")) ||
+        String(b.updatedAt||"").localeCompare(String(a.updatedAt||""));
+    });
+    return sessions[0] || null;
+  }
+
+  function latestReviewExercisePreview() {
+    var session=latestReviewExerciseSession();
+    if (!session) return null;
+    var labels=[isValidLargeCategory(session.division)?session.division:"",
+      session.subject && session.subject!=="全範囲" && !isInvalidSessionLabel(session.subject)?session.subject:""].filter(Boolean);
+    return {id:session.id,label:labels.join(" / ")||"直近の通常演習",
+      startedAt:session.startedAt||null,expectedTotal:Number(session.expectedTotal||0),
+      observed:(session.questionRefs||[]).length};
+  }
+
+  // ユーザーが右下の復習画面でボタンを押した場合にのみ、通常演習を収集する。
+  async function collectLatestExerciseForReview(onProgress) {
+    if (reviewCollectionRunning || exportRunning) throw new Error("問題の取得処理が進行中です");
+    var session=latestReviewExerciseSession();
+    if (!session) throw new Error("通常演習の履歴が見つかりません。演習問題を一度開いてから実行してください");
+    reviewCollectionRunning=true;
+    var progress=typeof onProgress==="function"?onProgress:function(){};
+    try {
+      progress({phase:"reading",scanned:0,total:Number(session.expectedTotal||0)});
+      var questions=await crawlSessionQuestions(session,null,progress);
+      var exerciseAt=session.startedAt||session.updatedAt||nowIso();
+      var importedIds=[], published=0, wrong=0, skipped=0;
+      questions.forEach(function(q){
+        if (!q || !q.problemNumber) return;
+        q.reviewExerciseSessionId=session.id;
+        q.reviewExerciseAt=exerciseAt;
+        state.questionCache[q.problemNumber]=q;
+        var evidence=reviewEvidence(q);
+        if (!evidence) {skipped++;return;}
+        if(publishReviewQuestion(q,true)){
+          importedIds.push(String(q.problemNumber));
+          published++;
+          if(evidence.mark==="×"||evidence.mark==="△")wrong++;
+        } else {skipped++;}
+      });
+      saveState(true);
+      var expected=Number(session.expectedTotal||0);
+      var positions=new Set(questions.map(function(q){return Number(q.position)})
+        .filter(function(n){return Number.isInteger(n)&&n>0}));
+      var missing=expected?Math.max(0,expected-positions.size):null;
+      var failures=Array.isArray(questions.acquisitionFailures)?questions.acquisitionFailures.length:0;
+      var preview=latestReviewExercisePreview();
+      var summary={sessionId:session.id,sessionAt:exerciseAt,
+        label:preview?preview.label:"直近の通常演習",ids:importedIds,
+        scanned:questions.length,imported:published,wrong:wrong,skipped:skipped,
+        expected:expected,missing:missing,failures:failures,
+        partial:failures>0||(missing!==null&&missing>0)};
+      if(typeof window.__montreReviewIntegratedSessionDone==="function")
+        window.__montreReviewIntegratedSessionDone(summary);
+      announceReviewStatus("sync-finished");
+      progress({phase:"done",scanned:questions.length,total:expected,summary:summary});
+      return summary;
+    } finally {reviewCollectionRunning=false;}
   }
 
   function buildExportPayload(session, questions, range) {
