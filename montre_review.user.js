@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         モントレ 誤答復習（2周目・3周目）
 // @namespace    https://github.com/Factbact/cbt-anki-inbox/montre-review
-// @version      1.4.0
-// @description  Anki追加箱から誤答を自動同期。選択肢別の解説・折りたたみ・分野別復習に対応。
+// @version      1.5.0
+// @description  Anki用スクリプトの接続診断・自動同期、2段階の分野選択と検索、選択肢別解説。
 // @match        https://m3e-medical.com/users/cbt*
 // @match        https://www.m3e-medical.com/users/cbt*
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_review.user.js
@@ -18,6 +18,7 @@
 
   const STORE_KEY = 'montreReview.v1';
   const SESSION_KEY = 'montreReview.session.v1';
+  const FILTER_KEY = 'montreReview.filterSettings.v2';
   const BRIDGE_KEY = 'montreReview.bridge.v1';
   const SEED = [];
   const BAD = new Set(['×','△']);
@@ -26,13 +27,23 @@
   let session;
   let selected = new Set();
   let checkedResult = null;
+  let filterSubject = '';
   let filterTopic = '';
+  let filterSearch = '';
+  let showAllTopics = false;
   let screen = 'home';
   let notice = '';
   let syncReady = false;
   let syncedCount = 0;
   let lastSyncAt = '';
   let syncTimer = null;
+  let sourceVersion = '';
+  let sourceCacheTotal = null;
+  let sourceEligible = null;
+  let sourcePhase = '';
+  let lastStatusAt = 0;
+  let syncRequestedAt = 0;
+  let retryCount = 0;
   const jsonParse = (s, fallback) => { try { return JSON.parse(s); } catch { return fallback; } };
   const esc = s => String(s ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const cleanText = x => typeof x === 'string' ? x.slice(0,30000) : '';
@@ -134,6 +145,12 @@
     if (!store || typeof store !== 'object' || store.v!==1 || !store.questions || !store.attempts) store = {v:1, questions:{},attempts:{}};
     for (const raw of SEED) { const q=normalize(raw); if(q) mergeQuestion(q); }
     persist();
+    const savedFilters = jsonParse(localStorage.getItem(FILTER_KEY),null);
+    if(savedFilters && typeof savedFilters==='object'){
+      filterSubject=typeof savedFilters.subject==='string'?savedFilters.subject:'';
+      filterTopic=typeof savedFilters.topic==='string'?savedFilters.topic:'';
+      filterSearch=typeof savedFilters.search==='string'?savedFilters.search:'';
+    }
     session = jsonParse(localStorage.getItem(SESSION_KEY), null);
     if (!session || !Array.isArray(session.ids) || !Number.isInteger(session.index)) session=null;
   }
@@ -142,9 +159,67 @@
   const latest = q => {const h=history(q.id);return h.length ? h[h.length-1].mark : q.initial;};
   const isBad = q => BAD.has(q.initial);
   const needsReview = q => isBad(q) && latest(q)!=='○';
-  const topicOptions = () => [...new Set(all().map(q=>[q.subject,q.topic].filter(Boolean).join(' / ')))].filter(Boolean).sort((a,b)=>a.localeCompare(b,'ja'));
   const categoryLabel = q => [q.subject,q.topic].filter(Boolean).join(' / ') || '未分類';
-  const filtered = items => filterTopic ? items.filter(q=>categoryLabel(q)===filterTopic) : items;
+  const subjectName = q => String(q.subject||'未分類').trim()||'未分類';
+  const topicName = q => String(q.topic||'その他').trim()||'その他';
+  function saveFilters(){
+    try{localStorage.setItem(FILTER_KEY,JSON.stringify({subject:filterSubject,topic:filterTopic,search:filterSearch}));}
+    catch(_e){}
+  }
+  const searchMatch = q => !filterSearch.trim() ||
+    (subjectName(q)+' '+topicName(q)).toLocaleLowerCase('ja').includes(filterSearch.trim().toLocaleLowerCase('ja'));
+  const filtered = items => items.filter(q =>
+    (!filterSubject||subjectName(q)===filterSubject) &&
+    (!filterTopic||topicName(q)===filterTopic) && searchMatch(q)
+  );
+  function subjectOptions(){
+    const categories = new Map();
+    for(const q of all()){
+      const name=subjectName(q);
+      if(!categories.has(name))categories.set(name,{name,total:0,pending:0,found:false});
+      const item=categories.get(name);
+      item.total++;
+      if(needsReview(q))item.pending++;
+      if(searchMatch(q))item.found=true;
+    }
+    return [...categories.values()].filter(x=>x.found||x.name===filterSubject).sort((a,b)=>b.pending-a.pending||a.name.localeCompare(b.name,'ja'));
+  }
+  function topicOptions(){
+    if(!filterSubject)return[];
+    const topics=new Map();
+    for(const q of all()){
+      if(subjectName(q)!==filterSubject||!searchMatch(q))continue;
+      const name=topicName(q);
+      if(!topics.has(name))topics.set(name,{name,total:0,pending:0});
+      const item=topics.get(name);item.total++;
+      if(needsReview(q))item.pending++;
+    }
+    return [...topics.values()].sort((a,b)=>b.pending-a.pending||a.name.localeCompare(b.name,'ja'));
+  }
+  function filterHtml(){
+    const subjects=subjectOptions();
+    const subjectsHtml=subjects.map(c=>`<button type="button" class="cat-pill ${filterSubject===c.name?'chosen':''}" data-action="subject-filter" data-subject="${esc(c.name)}" aria-pressed="${filterSubject===c.name}">
+      <span>${esc(c.name)}</span><small>${c.pending} / ${c.total}問</small></button>`).join('');
+    const topics=topicOptions();
+    const visibleTopics=showAllTopics?topics:topics.slice(0,8);
+    const topicsHtml=visibleTopics.map(c=>`<button type="button" class="cat-pill sub-pill ${filterTopic===c.name?'chosen':''}" data-action="topic-filter" data-topic="${esc(c.name)}" aria-pressed="${filterTopic===c.name}">
+      <span>${esc(c.name)}</span><small>${c.pending} / ${c.total}問</small></button>`).join('');
+    const current=[filterSubject||'全科目',filterTopic].filter(Boolean).join(' › ');
+    const selectedCount=getQueue('pending').length;
+    return `<section class="filter-panel" aria-label="復習する分野">
+      <div class="filter-head"><strong>復習する分野</strong><button type="button" data-action="reset-filter" class="filter-clear">絞り込みを解除</button></div>
+      <label class="filter-search-label" for="topic-search">分野名を検索</label>
+      <input id="topic-search" type="search" placeholder="呼吸器、肺炎、循環器など" value="${esc(filterSearch)}" autocomplete="off" spellcheck="false">
+      <div class="filter-subtitle">① 大分類を選ぶ <span class="filter-hint">未克服数 / 登録数</span></div>
+      <div class="cat-pills"><button type="button" class="cat-pill ${!filterSubject?'chosen':''}" data-action="subject-filter" data-subject="" aria-pressed="${!filterSubject}"><span>全科目</span><small>${all().filter(needsReview).length} / ${all().length}問</small></button>${subjectsHtml}</div>
+      ${filterSubject?`<div class="filter-subtitle">② ${esc(filterSubject)}の小分野を選ぶ</div>
+        <div class="cat-pills"><button type="button" class="cat-pill sub-pill ${!filterTopic?'chosen':''}" data-action="topic-filter" data-topic="" aria-pressed="${!filterTopic}"><span>全小分野</span></button>${topicsHtml}</div>
+        ${topics.length>8?`<button type="button" class="filter-more" data-action="more-topics">${showAllTopics?'小分野を折りたたむ':'残り'+(topics.length-8)+'分野を表示'}</button>`:''}
+        ${!topics.length?'<p class="sub">該当する小分野はない。</p>':''}`:
+        '<p class="sub filter-help">大分類を選ぶと小分野が表示される。検索欄で直接絞ることもできる。</p>'}
+      <div class="filter-summary">選択中：<strong>${esc(current)}</strong>${filterSearch?'（検索：'+esc(filterSearch)+'）':''}<span>未克服 <strong>${selectedCount}問</strong></span></div>
+    </section>`;
+  }
   const sorter = (a,b) => (a.subject||'').localeCompare(b.subject||'','ja') || (a.position??9999)-(b.position??9999) || a.id.localeCompare(b.id);
   const sorted = items => [...items].sort(sorter);
   const getQueue = kind => {
@@ -276,6 +351,29 @@
   .exp-common{border-left:3px solid #b4c6d9;background:#f7f9fc;border-radius:7px;margin:10px 0;padding:10px 13px;white-space:pre-wrap;line-height:1.85}
   .exp-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:15px}
   .sync-status{font-size:12px;color:#375773;margin:7px 0 12px}
+  .filter-panel{background:#f8fafc;border:1px solid #d6e0ea;border-radius:12px;padding:15px;margin:14px 0 18px}
+  .filter-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:9px}
+  .filter-head strong{font-size:15px}.filter-clear{padding:5px 8px;border:0;background:transparent;color:#246fa5;text-decoration:underline;font-size:12px}
+  .filter-search-label{display:block;font-size:12px;font-weight:600;color:#38546e;margin-bottom:4px}
+  #topic-search{width:100%;padding:10px 12px;background:white;border:1px solid #b4c7d9;border-radius:9px;font:inherit;font-size:14px;color:#182b41}
+  #topic-search:focus{outline:2px solid #276eaf;outline-offset:1px}
+  .filter-subtitle{font-size:13px;font-weight:700;margin:14px 0 7px;color:#223e55}
+  .filter-hint{font-size:11px;font-weight:400;color:#667889;margin-left:7px}
+  .cat-pills{display:flex;flex-wrap:wrap;gap:7px;max-height:200px;overflow:auto;padding:2px 0}
+  .cat-pill{display:inline-flex;align-items:center;gap:8px;padding:8px 11px;border:1px solid #d0dce7;border-radius:9px;background:#fff;color:#26445c;font-size:13px;font-weight:650;max-width:100%;text-align:left}
+  .cat-pill small{font-size:11px;font-weight:500;color:#68798a;white-space:nowrap}
+  .cat-pill.chosen{background:#194c7d;border-color:#194c7d;color:#fff}
+  .cat-pill.chosen small{color:#dceafa}
+  .sub-pill{font-weight:500}
+  .filter-summary{display:flex;gap:7px;flex-wrap:wrap;align-items:center;border-top:1px solid #dce4ef;padding-top:10px;margin-top:11px;font-size:13px}
+  .filter-summary span{margin-left:auto}
+  .filter-help{margin:9px 0}
+  .filter-more{margin-top:8px;color:#194c7d}
+  .sync-diagnostic{padding:10px 12px;border:1px solid #d3deea;border-radius:9px;background:#f4f7fb;margin-bottom:12px;font-size:13px}
+  .sync-diagnostic.attention{border-color:#ead29b;background:#fff8e8}
+  .sync-diagnostic a{color:#1d5e90;text-decoration:underline}
+  @media(max-width:600px){.cat-pills{max-height:190px}.cat-pill{font-size:12px;padding:7px 9px}.filter-panel{padding:11px}}
+
 
   .images{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px}.images img{max-width:min(100%,460px);max-height:370px;object-fit:contain;border:1px solid #e1e7ef;border-radius:6px;background:white}
   .progress{height:7px;background:#e3eaf2;border-radius:5px;overflow:hidden;margin:10px 0 17px}.progress>div{height:100%;background:#3f789f}
@@ -295,15 +393,28 @@
     render();
     shadow.addEventListener('click',handleClick);
     shadow.addEventListener('change',handleChange);
+    shadow.addEventListener('input', e => {
+      if(e.target.id!=='topic-search'||e.isComposing)return;
+      const el=e.target;
+      const start=el.selectionStart,end=el.selectionEnd;
+      filterSearch=el.value;saveFilters();render();
+      const next=shadow.querySelector('#topic-search');
+      if(next){next.focus();try{next.setSelectionRange(start,end);}catch(_e){}}
+    });
+    shadow.addEventListener('compositionend',e=>{
+      if(e.target.id!=='topic-search')return;
+      filterSearch=e.target.value;saveFilters();render();
+      shadow.querySelector('#topic-search')?.focus();
+    });
     document.addEventListener('keydown',e=>{if(e.key==='Escape' && screen!=='closed'){screen='closed';render();}});
   }
   function render() {
     if(!app)return;
-    if(screen==='closed'){app.innerHTML=`<button id="launcher" data-action="open">誤答復習 v1.4（同期はこちら）</button>`;return;}
+    if(screen==='closed'){app.innerHTML=`<button id="launcher" data-action="open">誤答復習 v1.5（分野・同期）</button>`;return;}
     const body=screen==='home'?homeHtml():screen==='quiz'?quizHtml():endHtml();
     app.innerHTML=`<button id="launcher" data-action="toggle" style="display:none">誤答復習</button>
       <div id="backdrop"><section id="modal" role="dialog" aria-modal="true" aria-label="モントレ誤答復習">
-      <header class="top"><h2>モントレ 誤答復習 v1.4</h2><small>ブラウザ内で保存</small><button data-action="home" aria-label="ホーム">一覧</button><button data-action="close" aria-label="閉じる">✕</button></header>
+      <header class="top"><h2>モントレ 誤答復習 v1.5</h2><small>ブラウザ内で保存</small><button data-action="home" aria-label="ホーム">一覧</button><button data-action="close" aria-label="閉じる">✕</button></header>
       <main>${notice?`<div class="notice">${esc(notice)}</div>`:''}${body}</main></section></div>`;
     notice='';
   }
@@ -313,13 +424,12 @@
     const originalTriangle=qs.filter(q=>q.initial==='△').length;
     const reviewed=qs.filter(q=>history(q.id).length).length;
     const pending=qs.filter(needsReview).length;
-    const topics=topicOptions();
     const resumable=session && session.ids?.length>0;
     return `<h3>間違えた問題だけを解き直す</h3>
       <div class="sync-status">自動同期：${syncReady?'Anki追加箱と接続中':'Anki追加箱からの応答待ち'} ／ 今回更新 ${syncedCount}問 ${lastSyncAt?'（最終 '+esc(new Date(lastSyncAt).toLocaleTimeString('ja-JP'))+'）':''} <button data-action="sync">Ankiから同期</button></div>
       <div class="stats"><div class="stat"><b>${qs.length}</b><span>登録問題数</span></div><div class="stat"><b>${pending}</b><span>未克服</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&latest(q)==='○').length}</b><span>克服済み</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&history(q.id).length&&BAD.has(latest(q))).length}</b><span>再誤答</span></div></div>
       <p class="sub">初回 ×：${originalWrong}問 ／ 初回 △：${originalTriangle}問 ／ 復習履歴あり：${reviewed}問</p>
-      <label class="select"><span>分野</span><select id="topic-select"><option value="">全分野</option>${topics.map(t=>`<option value="${esc(t)}" ${t===filterTopic?'selected':''}>${esc(t)}</option>`).join('')}</select></label>
+      ${filterHtml()}
       <div class="card"><strong>復習を開始</strong><p class="sub">正解した問題は「未克服」のリストから外れる。△・×は残る。</p>
         <div class="actions"><button class="primary" data-action="start" data-kind="pending">未克服だけ（${getQueue('pending').length}問）</button><button data-action="start" data-kind="all-bad">初回 ×・△ 全件（${getQueue('all-bad').length}問）</button></div>
         <div class="actions"><button data-action="start" data-kind="first-wrong">初回 × のみ（${getQueue('first-wrong').length}問）</button><button data-action="start" data-kind="repeat-bad">復習後も ×・△（${getQueue('repeat-bad').length}問）</button></div>
@@ -435,13 +545,17 @@
     else if(a==='next'){jump(1);}
     else if(a==='check'){check();}
     else if(a==='mark'){const q=currentQ();if(q && checkedResult){updateLast(q,btn.dataset.mark);render();}}
+    else if(a==='subject-filter'){filterSubject=btn.dataset.subject||'';filterTopic='';showAllTopics=false;saveFilters();render();}
+    else if(a==='topic-filter'){filterTopic=btn.dataset.topic||'';saveFilters();render();}
+    else if(a==='reset-filter'){filterSubject='';filterTopic='';filterSearch='';showAllTopics=false;saveFilters();render();}
+    else if(a==='more-topics'){showAllTopics=!showAllTopics;render();}
     else if(a==='backup'){downloadBackup();}
     else if(a==='sync'){syncReady=false;requestAutoSync();notice='Anki追加箱の取得済み問題を再確認しています。';render();}
     else if(a==='expand-explanations'){const details=[...shadow.querySelectorAll('.exp-group details')];const expand=details.some(d=>!d.open);details.forEach(d=>d.open=expand);btn.textContent=expand?'すべて閉じる':'すべて展開';}
   }
   function handleChange(e) {
     const el=e.target;
-    if(el.id==='topic-select'){filterTopic=el.value;render();return;}
+    if(el.id==='topic-search'){filterSearch=el.value;saveFilters();render();return;}
     if(el.id==='import-file'){
       const files=[...el.files];
       (async()=>{
