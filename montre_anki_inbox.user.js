@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.9.0
+// @version      2.9.1
 // @description  Anki追加箱と誤答復習を統合。直近の通常演習の×・△をワンクリック取得。
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.9.0";
+  var VERSION = "2.9.1";
   var REVIEW_BRIDGE_KEY = "montreReview.bridge.v1";
   var reviewPublished = {};
   var reviewReplayActive = false;
@@ -1428,14 +1428,15 @@
       var payload = JSON.stringify(packet);
       if (payload.length > 240000) return false;
       try { localStorage.setItem(REVIEW_BRIDGE_KEY, payload); } catch (_err) {}
+      var accepted = true;
       if (typeof window.__montreReviewIntegratedIngest === "function") {
-        window.__montreReviewIntegratedIngest(payload);
+        accepted = window.__montreReviewIntegratedIngest(payload) !== false;
       } else {
         window.dispatchEvent(new CustomEvent("montre-review:question", { detail: payload }));
         window.postMessage(payload, location.origin);
       }
       reviewPublished[id] = fingerprint;
-      return true;
+      return accepted;
     } catch (_error) {
       // 復習連携の失敗がAnki本体へ波及しないようにする。
       return false;
@@ -2923,7 +2924,7 @@ try {
  const packet=jsonParse(payload,null);
  if(!packet||packet.kind!=='montre-review-question-v1'||!packet.question)return;
  const raw=packet.question;
- if(!['○','×','△'].includes(raw.selfEvaluation))return;
+ if(!['○','×','△'].includes(raw.selfEvaluation))return false;
  const explicit = raw.selfEvaluationConfirmed === true;
  const derived = raw.reviewMarkVerified === true &&
    raw.reviewEvaluationSource === 'answer-comparison' &&
@@ -2932,16 +2933,19 @@ try {
    Array.isArray(raw.correctAnswer) && raw.correctAnswer.length > 0 &&
    raw.selfEvaluation === (arraysEqual(raw.correctAnswer,raw.selectedAnswer)?'○':'×') &&
    raw.answerCorrectness === (raw.selfEvaluation === '○' ? 'correct' : 'incorrect');
- if (!explicit && !derived) return;
+ if (!explicit && !derived) return false;
  const q=normalize(raw);
- if(!q)return;
+ if(!q)return false;
  syncReady=true;
  const previous=store.questions[q.id], old=previous?JSON.stringify(previous):'';
+ // 正答済みの新規問題は保存しない。以前×・△だった問題の○への更新は保持する。
+ if(!previous && q.exerciseLastMark==='○')return false;
  mergeQuestion(q);
  if(!previous||old!==JSON.stringify(store.questions[q.id])){
    syncedCount++;lastSyncAt=new Date().toISOString();queueSyncSave();
  }
  try{if(localStorage.getItem(BRIDGE_KEY)===payload)localStorage.removeItem(BRIDGE_KEY);}catch(_e){}
+ return true;
 }
 
   function requestAutoSync(){
@@ -3360,7 +3364,7 @@ try {
       // 今回の演習が確実に見えるよう、以前の分野フィルターを解除する。
       filterSubject='';filterTopic='';filterSearch='';showAllTopics=false;saveFilters();
       const extra=result.partial?'（取得できない問題があるため、一部のみ）':'';
-      notice=`通常演習 ${result.scanned}問を確認。×・△ ${result.wrong}問、登録対象 ${result.imported}問${extra}。`;
+      notice=`通常演習 ${result.scanned}問を確認。×・△ ${result.wrong}問、今回保存 ${result.imported}問${extra}。`;
     }catch(error){
       notice='演習の一括取得に失敗：'+(error?.message||String(error));
     }finally{latestImportRunning=false;render();}
