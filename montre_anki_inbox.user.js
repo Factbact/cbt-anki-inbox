@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.7.1
+// @version      2.8.0
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.7.1";
+  var VERSION = "2.8.0";
   var REVIEW_BRIDGE_KEY = "montreReview.bridge.v1";
   var reviewPublished = {};
   var reviewReplayActive = false;
@@ -1367,12 +1367,26 @@
 
   // モントレ誤答復習へ、確定した演習結果のみをローカルで受け渡す。
   // GitHubや外部サーバーに問題文を送信しない。
+  function reviewEvidence(question) {
+    if (!question || !Array.isArray(question.correctAnswer) || !question.correctAnswer.length ||
+        !Array.isArray(question.choices) || !question.choices.length ||
+        !String(question.questionText || "").trim()) return null;
+    if (question.selfEvaluationConfirmed === true &&
+        ["○", "×", "△"].indexOf(question.selfEvaluation) !== -1) {
+      return { mark: question.selfEvaluation, method: "explicit" };
+    }
+    // 解答と正答・判定が一致する場合だけ正誤を再利用する。
+    if (question.evaluationSource !== "answer-comparison" ||
+        !Array.isArray(question.selectedAnswer) || !question.selectedAnswer.length) return null;
+    var expected = sameLetters(question.correctAnswer, question.selectedAnswer) ? "○" : "×";
+    if (question.selfEvaluation !== expected ||
+        question.answerCorrectness !== (expected === "○" ? "correct" : "incorrect")) return null;
+    return { mark: expected, method: "answer-comparison" };
+  }
+
   function makeReviewPacket(question) {
-    if (!question || question.selfEvaluationConfirmed !== true ||
-      !/[○×△]/.test(question.selfEvaluation || "") ||
-      !Array.isArray(question.correctAnswer) || !question.correctAnswer.length ||
-      !Array.isArray(question.choices) || !question.choices.length ||
-      !String(question.questionText || "").trim()) return null;
+    var evidence = reviewEvidence(question);
+    if (!evidence) return null;
     return {
       kind: "montre-review-question-v1",
       question: {
@@ -1383,9 +1397,12 @@
         }),
         correctAnswer: question.correctAnswer.slice(0, 25),
         selectedAnswer: Array.isArray(question.selectedAnswer) ? question.selectedAnswer.slice(0, 25) : [],
-        selfEvaluation: question.selfEvaluation,
-        selfEvaluationConfirmed: true,
+        selfEvaluation: evidence.mark,
+        selfEvaluationConfirmed: question.selfEvaluationConfirmed === true,
+        reviewMarkVerified: true,
+        reviewEvaluationSource: evidence.method,
         selfEvaluationRaw: question.selfEvaluationRaw,
+        evaluationSource: question.evaluationSource,
         answerCorrectness: question.answerCorrectness,
         explanation: String(question.explanation || "").slice(0, 30000),
         images: Array.isArray(question.images) ? question.images.slice(0, 12).map(function (img) {
@@ -1410,6 +1427,10 @@
       if (payload.length > 240000) return;
       // ロード順が異なるときのために最後の1問のみ一時保管する。
       try { localStorage.setItem(REVIEW_BRIDGE_KEY, payload); } catch (_err) {}
+      if (typeof window.__montreReviewIntegratedIngest === "function") {
+        window.__montreReviewIntegratedIngest(payload);
+        return;
+      }
       window.dispatchEvent(new CustomEvent("montre-review:question", { detail: payload }));
       window.postMessage(payload, location.origin);
     } catch (_error) {
@@ -1427,8 +1448,14 @@
         kind: "montre-review-status-v2",
         version: VERSION, phase: phase || "ready",
         cacheTotal: cached.length, eligible: eligible,
+        explicit: cached.filter(function (q) { var p = makeReviewPacket(q); return p && p.question.reviewEvaluationSource === "explicit"; }).length,
+        inferred: cached.filter(function (q) { var p = makeReviewPacket(q); return p && p.question.reviewEvaluationSource === "answer-comparison"; }).length,
         active: true
       });
+      if (typeof window.__montreReviewIntegratedStatus === "function") {
+        window.__montreReviewIntegratedStatus(payload);
+        return;
+      }
       window.postMessage(payload, location.origin);
       window.dispatchEvent(new CustomEvent("montre-review:status", {detail: payload}));
     } catch (_error) {
@@ -1455,6 +1482,7 @@
   }
 
   function installReviewBridge() {
+    window.__montreReviewIntegratedRequest = replayReviewCache;
     window.addEventListener("montre-review:sync-request", replayReviewCache);
     window.addEventListener("message", function (event) {
       if (event.source !== window || event.origin !== location.origin ||
