@@ -112,12 +112,43 @@
 }
 
   function requestAutoSync(){
+ syncRequestedAt=Date.now();
  try{window.dispatchEvent(new CustomEvent('montre-review:sync-request'));}catch(_e){}
  try{window.postMessage(JSON.stringify({kind:'montre-review-sync-request-v1'}),location.origin);}catch(_e){}
 }
 
+  function acceptSourceStatus(payload){
+    const data=typeof payload==='string'?jsonParse(payload,null):payload;
+    if(!data||data.kind!=='montre-review-status-v2')return;
+    syncReady=true;sourceVersion=String(data.version||'不明');
+    sourceCacheTotal=Number.isSafeInteger(data.cacheTotal)?data.cacheTotal:null;
+    sourceEligible=Number.isSafeInteger(data.eligible)?data.eligible:null;
+    sourcePhase=String(data.phase||'ready');
+    lastStatusAt=Date.now();
+    if(screen==='home')render();
+  }
+  function syncDiagnosticHtml(){
+    const base='https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js';
+    if(!sourceVersion){
+      return `<div class="sync-diagnostic attention"><strong>自動同期：Anki追加箱の応答を確認できていない</strong>
+        <p>Anki追加箱 v2.7.0以上に更新し、両方のスクリプトを有効にして、モントレの同じページを再読み込みしてください。</p>
+        <a href="${base}" target="_blank" rel="noopener noreferrer">Anki追加箱を更新する ↗</a>
+        <button data-action="sync" type="button">接続を再確認</button></div>`;
+    }
+    const cache=sourceCacheTotal==null?'不明':sourceCacheTotal+'問';
+    const eligible=sourceEligible==null?'不明':sourceEligible+'問';
+    let reason='';
+    if(sourceEligible===0)reason='同期可能な問題が0問。Anki追加箱に正答・選択肢・確定した自己評価が保存されているか確認してください。';
+    else if(sourcePhase==='sync-finished'&&sourceEligible>0&&syncedCount===0&&all().length===0)reason='送信対象はあるが登録0問です。JSONからの手動読み込みも試してください。';
+    else if(sourceCacheTotal===0)reason='Anki追加箱の問題キャッシュが空です。モントレで問題を解き、自己評価を確定してください。';
+    return `<div class="sync-diagnostic"><strong>自動同期：Anki追加箱 v${esc(sourceVersion)} と接続済み</strong>
+      <p>取得済み ${esc(cache)} ／ 同期条件を満たす ${esc(eligible)} ／ 今回の新規・更新 ${syncedCount}問 ／ 復習登録 ${all().length}問</p>
+      ${reason?`<p>${esc(reason)}</p>`:''}
+      <button type="button" data-action="sync">Ankiから再同期</button></div>`;
+  }
   function installAutoSync(){
  window.addEventListener('montre-review:question',receiveAutoQuestion);
+ window.addEventListener('montre-review:status',e=>acceptSourceStatus(e.detail));
  window.addEventListener('montre-review:anki-ready',()=>{
    syncReady=true;requestAutoSync();if(screen==='home')render();
  });
@@ -125,12 +156,15 @@
    if(e.source!==window||e.origin!==location.origin||typeof e.data!=='string'||e.data.length>250000)return;
    const packet=jsonParse(e.data,null);
    if(packet?.kind==='montre-review-question-v1')receiveAutoQuestion({detail:e.data});
+   if(packet?.kind==='montre-review-status-v2')acceptSourceStatus(packet);
    if(packet?.kind==='montre-review-ready-v1'&&!syncReady){
      syncReady=true;requestAutoSync();if(screen==='home')render();
    }
  });
  receiveAutoQuestion(null);
  requestAutoSync();
+ setTimeout(()=>{if(!sourceVersion)requestAutoSync();},1800);
+ setTimeout(()=>{if(!sourceVersion)requestAutoSync();},4800);
 }
 
   function persist() {
@@ -411,11 +445,13 @@
   function render() {
     if(!app)return;
     if(screen==='closed'){app.innerHTML=`<button id="launcher" data-action="open">誤答復習 v1.5（分野・同期）</button>`;return;}
+    const scroll=app.querySelector('main')?.scrollTop||0;
     const body=screen==='home'?homeHtml():screen==='quiz'?quizHtml():endHtml();
     app.innerHTML=`<button id="launcher" data-action="toggle" style="display:none">誤答復習</button>
       <div id="backdrop"><section id="modal" role="dialog" aria-modal="true" aria-label="モントレ誤答復習">
       <header class="top"><h2>モントレ 誤答復習 v1.5</h2><small>ブラウザ内で保存</small><button data-action="home" aria-label="ホーム">一覧</button><button data-action="close" aria-label="閉じる">✕</button></header>
       <main>${notice?`<div class="notice">${esc(notice)}</div>`:''}${body}</main></section></div>`;
+    const main=app.querySelector('main');if(main)main.scrollTop=scroll;
     notice='';
   }
   function homeHtml() {
@@ -426,7 +462,7 @@
     const pending=qs.filter(needsReview).length;
     const resumable=session && session.ids?.length>0;
     return `<h3>間違えた問題だけを解き直す</h3>
-      <div class="sync-status">自動同期：${syncReady?'Anki追加箱と接続中':'Anki追加箱からの応答待ち'} ／ 今回更新 ${syncedCount}問 ${lastSyncAt?'（最終 '+esc(new Date(lastSyncAt).toLocaleTimeString('ja-JP'))+'）':''} <button data-action="sync">Ankiから同期</button></div>
+      ${syncDiagnosticHtml()}
       <div class="stats"><div class="stat"><b>${qs.length}</b><span>登録問題数</span></div><div class="stat"><b>${pending}</b><span>未克服</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&latest(q)==='○').length}</b><span>克服済み</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&history(q.id).length&&BAD.has(latest(q))).length}</b><span>再誤答</span></div></div>
       <p class="sub">初回 ×：${originalWrong}問 ／ 初回 △：${originalTriangle}問 ／ 復習履歴あり：${reviewed}問</p>
       ${filterHtml()}
@@ -550,7 +586,7 @@
     else if(a==='reset-filter'){filterSubject='';filterTopic='';filterSearch='';showAllTopics=false;saveFilters();render();}
     else if(a==='more-topics'){showAllTopics=!showAllTopics;render();}
     else if(a==='backup'){downloadBackup();}
-    else if(a==='sync'){syncReady=false;requestAutoSync();notice='Anki追加箱の取得済み問題を再確認しています。';render();}
+    else if(a==='sync'){requestAutoSync();notice='Anki追加箱に再同期を要求しました。接続情報を確認してください。';render();}
     else if(a==='expand-explanations'){const details=[...shadow.querySelectorAll('.exp-group details')];const expand=details.some(d=>!d.open);details.forEach(d=>d.open=expand);btn.textContent=expand?'すべて閉じる':'すべて展開';}
   }
   function handleChange(e) {
