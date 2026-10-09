@@ -2848,6 +2848,9 @@ try {
   let lastStatusAt = 0;
   let syncRequestedAt = 0;
   let retryCount = 0;
+  let latestImportRunning = false;
+  let latestImportProgress = null;
+  let latestImportOutcome = null;
   const jsonParse = (s, fallback) => { try { return JSON.parse(s); } catch { return fallback; } };
   const esc = s => String(s ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const cleanText = x => typeof x === 'string' ? x.slice(0,30000) : '';
@@ -2870,7 +2873,12 @@ try {
     if (!title) return null;
     const context = raw.subjectContext || {};
     const imgs = (raw.images || []).map(i=>safeImage(typeof i === 'string'?i:i?.url)).filter(Boolean).slice(0,12);
+    const exerciseMark = ['○','×','△'].includes(raw.exerciseLastMark) ? raw.exerciseLastMark : initial;
+    const atValue = raw.exerciseLastAt || raw.reviewExerciseAt || raw.capturedAt || '';
+    const exerciseAt = atValue && Number.isFinite(Date.parse(atValue)) ? new Date(atValue).toISOString() : '';
+    const exerciseSessionId = safeId(raw.exerciseSessionId || raw.reviewExerciseSessionId || '');
     return { id,number:id,title,choices,answer,initial,
+      exerciseLastMark:exerciseMark,exerciseLastAt:exerciseAt,exerciseSessionId,
       topic:cleanText(raw.topic ?? context.category),subject:cleanText(raw.subject ?? context.largeCategory),
       url:safeUrl(raw.url), images:[...new Set(imgs)], explanation:cleanText(raw.explanation),
       position: Number.isFinite(+raw.position) ? +raw.position : null };
@@ -2880,9 +2888,21 @@ try {
   function mergeQuestion(q) {
     const old = store.questions[q.id];
     if (old) {
-      // 一度でも初回に誤答した設問を、後のJSONインポートで消さない。
+      // 既存の復習履歴を維持し、最初に間違えた情報も残す。
       q.initial = rankMark(old.initial)>rankMark(q.initial) ? old.initial : q.initial;
-      store.questions[q.id] = { ...old, ...q };
+      const previousAt = Date.parse(old.exerciseLastAt || '') || 0;
+      const incomingAt = Date.parse(q.exerciseLastAt || '') || 0;
+      const merged = { ...old, ...q };
+      // 以前の演習を読み込んでも、直近の通常演習の判定を巻き戻さない。
+      if (previousAt && (!incomingAt || incomingAt < previousAt)) {
+        merged.exerciseLastMark = old.exerciseLastMark;
+        merged.exerciseLastAt = old.exerciseLastAt;
+        merged.exerciseSessionId = old.exerciseSessionId;
+      } else if (!incomingAt && old.exerciseLastMark) {
+        merged.exerciseLastMark = old.exerciseLastMark;
+        merged.exerciseSessionId = old.exerciseSessionId;
+      }
+      store.questions[q.id] = merged;
       return false;
     }
     store.questions[q.id] = q;
@@ -2966,6 +2986,7 @@ try {
   function installAutoSync(){
  window.__montreReviewIntegratedIngest = payload => receiveAutoQuestion({detail:payload});
  window.__montreReviewIntegratedStatus = acceptSourceStatus;
+ window.__montreReviewIntegratedSessionDone = acceptCompletedExercise;
  window.addEventListener('montre-review:question',receiveAutoQuestion);
  window.addEventListener('montre-review:status',e=>acceptSourceStatus(e.detail));
  window.addEventListener('montre-review:anki-ready',()=>{
@@ -2996,6 +3017,7 @@ try {
   function init() {
     store = jsonParse(localStorage.getItem(STORE_KEY), null);
     if (!store || typeof store !== 'object' || store.v!==1 || !store.questions || !store.attempts) store = {v:1, questions:{},attempts:{}};
+    if (!store.latestExercise || !Array.isArray(store.latestExercise.ids)) store.latestExercise = null;
     for (const raw of SEED) { const q=normalize(raw); if(q) mergeQuestion(q); }
     persist();
     const savedFilters = jsonParse(localStorage.getItem(FILTER_KEY),null);
@@ -3009,9 +3031,17 @@ try {
   }
   const all = () => Object.values(store.questions).filter(q=>q&&q.id&&q.answer);
   const history = id => Array.isArray(store.attempts[id]) ? store.attempts[id] : [];
-  const latest = q => {const h=history(q.id);return h.length ? h[h.length-1].mark : q.initial;};
-  const isBad = q => BAD.has(q.initial);
-  const needsReview = q => isBad(q) && latest(q)!=='○';
+  const latest = q => {
+    const exerciseMark = q.exerciseLastMark || q.initial;
+    const h = history(q.id);
+    if(!h.length) return exerciseMark;
+    const last = h[h.length-1];
+    const exerciseAt = Date.parse(q.exerciseLastAt || '') || 0;
+    const reviewAt = Date.parse(last.at || '') || 0;
+    return !exerciseAt || reviewAt >= exerciseAt ? last.mark : exerciseMark;
+  };
+  const isBad = q => BAD.has(latest(q));
+  const needsReview = q => isBad(q);
   const categoryLabel = q => [q.subject,q.topic].filter(Boolean).join(' / ') || '未分類';
   const subjectName = q => String(q.subject||'未分類').trim()||'未分類';
   const topicName = q => String(q.topic||'その他').trim()||'その他';
@@ -3076,12 +3106,12 @@ try {
   const sorter = (a,b) => (a.subject||'').localeCompare(b.subject||'','ja') || (a.position??9999)-(b.position??9999) || a.id.localeCompare(b.id);
   const sorted = items => [...items].sort(sorter);
   const getQueue = kind => {
-    const items=filtered(all());
-    if(kind==='all-bad')return sorted(items.filter(isBad));
-    if(kind==='first-wrong')return sorted(items.filter(q=>q.initial==='×'));
-    if(kind==='all')return sorted(items);
-    if(kind==='repeat-bad')return sorted(items.filter(q=>history(q.id).length && BAD.has(latest(q))));
-    return sorted(items.filter(needsReview));
+    const pending=filtered(all()).filter(needsReview);
+    if (kind==='recent') {
+      const ids=new Set(store.latestExercise?.ids || []);
+      return sorted(pending.filter(q=>ids.has(q.id)));
+    }
+    return sorted(pending);
   };
   function record(q,mark,selectedLabels) {
     const items = history(q.id);
@@ -3098,8 +3128,8 @@ try {
   }
   function startQueue(kind) {
     const qs = getQueue(kind);
-    if(!qs.length){notice='この条件の復習対象は0問である。';render();return;}
-    session={ids:qs.map(q=>q.id),index:0,kind,startedAt:new Date().toISOString()};
+    if(!qs.length){notice='この条件で最新の結果が×・△の問題はありません。';render();return;}
+    session={ids:qs.map(q=>q.id),index:0,kind,startedAt:new Date().toISOString(),completed:false};
     selected.clear(); checkedResult=null;
     screen='quiz';persistSession();render();
   }
@@ -3107,7 +3137,10 @@ try {
   function jump(step) {
     if (!session) return;
     const next = session.index+step;
-    if(next<0 || next>=session.ids.length) {screen='end';render();return;}
+    if(next<0 || next>=session.ids.length) {
+      if (next>=session.ids.length) {session.completed=true;persistSession();}
+      screen='end';render();return;
+    }
     session.index=next;
     selected.clear();checkedResult=null;
     persistSession();render();
@@ -3222,6 +3255,13 @@ try {
   .filter-summary span{margin-left:auto}
   .filter-help{margin:9px 0}
   .filter-more{margin-top:8px;color:#194c7d}
+  .import-card{border-color:#aec8df;background:#f7fbff}
+  .import-card .actions button{flex:1}
+  .import-live{padding:8px 10px;background:#e9f2ff;border-radius:7px;color:#173f67;font-weight:600}
+  .start-card .actions{margin:8px 0 0}
+  .start-card .secondary-start{background:#f4f7fa}
+  .advanced-sync{margin-bottom:12px}
+  .advanced-sync summary{cursor:pointer;color:#365f86;font-size:12px}
   .sync-diagnostic{padding:10px 12px;border:1px solid #d3deea;border-radius:9px;background:#f4f7fb;margin-bottom:12px;font-size:13px}
   .sync-diagnostic.attention{border-color:#ead29b;background:#fff8e8}
   .sync-diagnostic a{color:#1d5e90;text-decoration:underline}
@@ -3279,24 +3319,97 @@ try {
     const main=app.querySelector('main');if(main)main.scrollTop=scroll;
     notice='';
   }
+
+  function acceptCompletedExercise(summary) {
+    if (!summary || !summary.sessionId || !Array.isArray(summary.ids)) return;
+    const previous=store.latestExercise;
+    const timestamp=Number.isFinite(Date.parse(summary.sessionAt)) ? summary.sessionAt : '';
+    const oldTime=previous?Date.parse(previous.at||'')||0:0;
+    const newTime=Date.parse(timestamp)||0;
+    // 同じ演習を再取得する場合は、取得済みのIDを欠落で消さない。
+    if(previous && previous.sessionId!==summary.sessionId && oldTime>newTime) return;
+    const ids=previous&&previous.sessionId===summary.sessionId ?
+      [...new Set([...previous.ids,...summary.ids.map(safeId)])] :
+      [...new Set(summary.ids.map(safeId))];
+    store.latestExercise={sessionId:summary.sessionId,at:timestamp,
+      label:cleanText(summary.label||'直近の通常演習').slice(0,200),ids,
+      scanned:Number(summary.scanned||0),expected:Number(summary.expected||0),
+      partial:Boolean(summary.partial)};
+    persist();
+    if(screen==='home') render();
+  }
+  function importLatestProgress(progress) {
+    if(!progress||typeof progress!=='object')return;
+    latestImportProgress=progress;
+    if(screen==='home')render();
+  }
+  async function startLatestImport() {
+    if(latestImportRunning)return;
+    const run=window.__montreReviewIntegratedImportLatest;
+    if(typeof run!=='function'){
+      notice='Anki追加箱の問題取得機能が見つかりません。v2.9以上に更新してページを再読み込みしてください。';
+      render();return;
+    }
+    latestImportRunning=true;
+    latestImportProgress={phase:'reading',scanned:0,total:0};
+    latestImportOutcome=null;
+    render();
+    try{
+      const result=await run(importLatestProgress);
+      latestImportOutcome=result;
+      // 今回の演習が確実に見えるよう、以前の分野フィルターを解除する。
+      filterSubject='';filterTopic='';filterSearch='';showAllTopics=false;saveFilters();
+      const extra=result.partial?'（取得できない問題があるため、一部のみ）':'';
+      notice=`通常演習 ${result.scanned}問を確認。×・△ ${result.wrong}問、登録対象 ${result.imported}問${extra}。`;
+    }catch(error){
+      notice='演習の一括取得に失敗：'+(error?.message||String(error));
+    }finally{latestImportRunning=false;render();}
+  }
+  function importPanelHtml(){
+    const info=typeof window.__montreReviewIntegratedLatestSession==='function'?
+      window.__montreReviewIntegratedLatestSession():null;
+    const recent=store.latestExercise;
+    const progress=latestImportProgress;
+    const during=latestImportRunning && progress;
+    const badge=info?`<span>${esc(info.label)}／${info.observed}問を履歴から確認${info.expectedTotal?'（全'+info.expectedTotal+'問）':''}</span>`:
+      '<span>通常演習の履歴がまだない。問題を解いた後に利用する。</span>';
+    const outcome=latestImportOutcome?`<p class="sub">直近の取込：確認 ${latestImportOutcome.scanned}問／×・△ ${latestImportOutcome.wrong}問
+      ${latestImportOutcome.partial?'／一部の問題を取得できなかった':''}</p>`:'';
+    const working=during?`<p role="status" class="import-live">取得中：${progress.scanned} / ${progress.total||'?'}問
+      （画面を閉じずに進捗を確認）</p>`:'';
+    return `<section class="card import-card">
+      <strong>通常演習が終わったら</strong>
+      <p class="sub">直近の演習を読み直し、×・△を自動で復習リストに取り込む。JSONのダウンロード操作は不要。</p>
+      <p class="sub">対象：${badge}</p>
+      <div class="actions"><button type="button" class="primary" data-action="import-latest" ${latestImportRunning||!info?'disabled':''}>
+        ${latestImportRunning?'演習の問題を取得中…':'今回の演習の×・△を一括登録'}</button></div>
+      ${working}${outcome}
+    </section>`;
+  }
+
   function homeHtml() {
     const qs=all();
     const originalWrong=qs.filter(q=>q.initial==='×').length;
     const originalTriangle=qs.filter(q=>q.initial==='△').length;
     const reviewed=qs.filter(q=>history(q.id).length).length;
     const pending=qs.filter(needsReview).length;
-    const resumable=session && session.ids?.length>0;
-    return `<h3>間違えた問題だけを解き直す</h3>
-      ${syncDiagnosticHtml()}
-      <div class="stats"><div class="stat"><b>${qs.length}</b><span>登録問題数</span></div><div class="stat"><b>${pending}</b><span>未克服</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&latest(q)==='○').length}</b><span>克服済み</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&history(q.id).length&&BAD.has(latest(q))).length}</b><span>再誤答</span></div></div>
+    const recent=store.latestExercise;
+    const latestCount=getQueue('recent').length;
+    const pendingCount=getQueue('pending').length;
+    const resumable=session && session.ids?.length>0 && !session.completed;
+    return `<h3>最後に×・△だった問題を復習</h3>
+      ${importPanelHtml()}
+      <div class="stats"><div class="stat"><b>${qs.length}</b><span>登録問題数</span></div><div class="stat"><b>${pending}</b><span>未克服</span></div><div class="stat"><b>${qs.filter(q=>(BAD.has(q.initial)||BAD.has(q.exerciseLastMark))&&latest(q)==='○').length}</b><span>克服済み</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&history(q.id).length&&BAD.has(latest(q))).length}</b><span>再誤答</span></div></div>
       <p class="sub">初回 ×：${originalWrong}問 ／ 初回 △：${originalTriangle}問 ／ 復習履歴あり：${reviewed}問</p>
-      ${filterHtml()}
-      <div class="card"><strong>復習を開始</strong><p class="sub">正解した問題は「未克服」のリストから外れる。△・×は残る。</p>
-        <div class="actions"><button class="primary" data-action="start" data-kind="pending">未克服だけ（${getQueue('pending').length}問）</button><button data-action="start" data-kind="all-bad">初回 ×・△ 全件（${getQueue('all-bad').length}問）</button></div>
-        <div class="actions"><button data-action="start" data-kind="first-wrong">初回 × のみ（${getQueue('first-wrong').length}問）</button><button data-action="start" data-kind="repeat-bad">復習後も ×・△（${getQueue('repeat-bad').length}問）</button></div>
+      <div class="card start-card"><strong>復習を開始</strong>
+        <p class="sub">最後の通常演習・復習で×または△だった問題だけ。○に変わった問題は出題しない。</p>
+        ${recent?`<p class="sub">直近の演習：${esc(recent.label)}</p>
+        <div class="actions"><button class="primary" data-action="start" data-kind="recent" ${!latestCount?'disabled':''}>直近の演習の×・△を復習（${latestCount}問）</button></div>`:''}
+        <div class="actions"><button class="${recent?'secondary-start':'primary'}" data-action="start" data-kind="pending" ${!pendingCount?'disabled':''}>${recent?'過去も含めて未克服を復習':'最新結果が×・△の問題を復習'}（${pendingCount}問）</button></div>
         ${resumable?`<div class="actions"><button data-action="resume">前回の続き（${Math.min(session.index+1,session.ids.length)} / ${session.ids.length}問）</button></div>`:''}
-        <p class="sub">復習した問題数：${reviewed}問。1周目の正誤はインポート時の記録である。</p>
       </div>
+      ${filterHtml()}
+      <details class="advanced-sync"><summary>同期状況・詳細設定</summary>${syncDiagnosticHtml()}</details>
       <div class="card"><strong>JSONの読み込み・バックアップ</strong>
         <p class="sub">Anki追加箱と統合済み。解答と正答の比較で誤答が自動登録される。旧JSONも取り込み可能。</p>
         <div class="actions"><label class="filepicker">JSONファイルを追加<input id="import-file" type="file" accept=".json,application/json" multiple></label><button data-action="backup">バックアップを書き出す</button></div>
@@ -3390,9 +3503,9 @@ try {
   function endHtml() {
     const ids=session?.ids || [];
     const done=ids.filter(id=>history(id).length).length;
-    const bad=ids.filter(id=>store.questions[id] && latest(store.questions[id])!=='○').length;
+    const bad=ids.filter(id=>store.questions[id] && needsReview(store.questions[id])).length;
     return `<h3>このセットの最後まで進んだ</h3><p>復習対象 ${ids.length}問／記録のある問題 ${done}問／現在 ×・△など ${bad}問</p>
-      <div class="actions"><button class="primary" data-action="home">一覧に戻る</button><button data-action="start" data-kind="pending">残った問題を復習する</button></div>`;
+      <div class="actions"><button class="primary" data-action="home">一覧に戻る</button><button data-action="start" data-kind="${session?.kind==='recent'?'recent':'pending'}">まだ×・△の問題を復習する</button></div>`;
   }
   function handleClick(e) {
     const btn=e.target.closest('[data-action]');if(!btn)return;
@@ -3410,6 +3523,7 @@ try {
     else if(a==='topic-filter'){filterTopic=btn.dataset.topic||'';saveFilters();render();}
     else if(a==='reset-filter'){filterSubject='';filterTopic='';filterSearch='';showAllTopics=false;saveFilters();render();}
     else if(a==='more-topics'){showAllTopics=!showAllTopics;render();}
+    else if(a==='import-latest'){startLatestImport();}
     else if(a==='backup'){downloadBackup();}
     else if(a==='sync'){requestAutoSync();notice='Anki追加箱に再同期を要求しました。接続情報を確認してください。';render();}
     else if(a==='expand-explanations'){const details=[...shadow.querySelectorAll('.exp-group details')];const expand=details.some(d=>!d.open);details.forEach(d=>d.open=expand);btn.textContent=expand?'すべて閉じる':'すべて展開';}
