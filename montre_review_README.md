@@ -4,10 +4,10 @@
 
 ## インストールと更新
 
-1. [Anki追加箱 v2.6.0以上](https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js) と [誤答復習 v1.3.0以上](https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_review.user.js) をTampermonkeyにインストールする。既存のAnki追加箱は置き換え更新し、無効化しない。
-2. すでに誤答復習 v1.0 / v1.1を入れている場合は、旧版だけ無効化する。
+1. [Anki追加箱 v2.6.0以上](https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_anki_inbox.user.js) と [誤答復習 v1.4.0以上](https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_review.user.js) をTampermonkeyにインストールする。既存のAnki追加箱は置き換え更新し、無効化しない。
+2. すでに誤答復習 v1.0 / v1.1を入れている場合は、旧版だけ無効化する。旧版は `@namespace: montre-review-local` で、新版はGitHubのnamespaceのため**別スクリプトとして表示される**。まず旧版を無効化し、動作確認後に削除する。Anki追加箱は有効のまま。
 3. モントレの問題を普段どおり解答する。**自己評価が確定した問題だけ**が、Anki追加箱から誤答復習に渡る。未解答問題は自動追加しない。
-4. 右下の「誤答復習を開く」をクリックする。「今すぐ同期」でAnki追加箱が以前に取得した問題も同期する。
+4. 右下の「誤答復習 v1.4（同期はこちら）」をクリックする。「今すぐ同期」でAnki追加箱が以前に取得した問題も同期する。
 5. 以前の「montre_anki_…json」も「JSONファイルを追加」から取り込める。
 
 両スクリプトとも `@updateURL` / `@downloadURL` が設定済み。更新はTampermonkeyの「更新を確認」で行う。更新時はスクリプトの `@version` を上げる。
@@ -28,4 +28,4 @@
 
 ## 実装の構成
 - `montre_anki_inbox.user.js` v2.6.0: 既存の取得機能を維持しつつ、確定済み問題を投稿するイベントブリッジを追加。
-- `montre_review.user.js` v1.3.0: ブリッジで受け取り、正規化・重複統合・保存し、出題画面を提供。
+- `montre_review.user.js` v1.4.0: ブリッジで受け取り、正規化・重複統合・保存し、出題画面を提供。
