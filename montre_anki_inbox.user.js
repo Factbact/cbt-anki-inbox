@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.6.0
+// @version      2.7.0
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.6.0";
+  var VERSION = "2.7.0";
   var REVIEW_BRIDGE_KEY = "montreReview.bridge.v1";
   var reviewPublished = {};
   var reviewReplayActive = false;
@@ -1388,7 +1388,27 @@
     }
   }
 
+  function announceReviewStatus(phase) {
+    try {
+      var cached = Object.values(state.questionCache || {});
+      var eligible = cached.filter(function (question) {
+        return Boolean(makeReviewPacket(question));
+      }).length;
+      var payload = JSON.stringify({
+        kind: "montre-review-status-v2",
+        version: VERSION, phase: phase || "ready",
+        cacheTotal: cached.length, eligible: eligible,
+        active: true
+      });
+      window.postMessage(payload, location.origin);
+      window.dispatchEvent(new CustomEvent("montre-review:status", {detail: payload}));
+    } catch (_error) {
+      // 診断情報でAnki本体を停止させない。
+    }
+  }
+
   function replayReviewCache() {
+    announceReviewStatus("sync-started");
     if (reviewReplayActive) return;
     reviewReplayActive = true;
     var saved = Object.values(state.questionCache || {});
@@ -1397,7 +1417,10 @@
       var end = Math.min(index + 12, saved.length);
       for (; index < end; index += 1) publishReviewQuestion(saved[index], true);
       if (index < saved.length) setTimeout(batch, 80);
-      else reviewReplayActive = false;
+      else {
+        reviewReplayActive = false;
+        announceReviewStatus("sync-finished");
+      }
     }
     batch();
   }
@@ -1411,6 +1434,7 @@
         if (JSON.parse(event.data).kind === "montre-review-sync-request-v1") replayReviewCache();
       } catch (_error) {}
     });
+    announceReviewStatus("ready");
     try {
       window.dispatchEvent(new CustomEvent("montre-review:anki-ready"));
       window.postMessage(JSON.stringify({ kind: "montre-review-ready-v1" }), location.origin);
@@ -2631,8 +2655,8 @@
       }
       readLargeCategoryMaps(document);
       currentContext = detectContext(document, location.href);
-      createUi();
       installReviewBridge();
+      createUi();
       installObservers();
       captureCurrentQuestion();
     } catch (error) {
