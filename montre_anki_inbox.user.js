@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.7.0
+// @version      2.7.1
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,7 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.7.0";
+  var VERSION = "2.7.1";
   var REVIEW_BRIDGE_KEY = "montreReview.bridge.v1";
   var reviewPublished = {};
   var reviewReplayActive = false;
@@ -213,7 +213,7 @@
         label = parent ? parent.querySelector("label") : null;
       }
       var name = stripCount(elementText(label));
-      if (name && state.largeCategoryMap[value] !== name) {
+      if (isValidLargeCategory(name) && state.largeCategoryMap[value] !== name) {
         state.largeCategoryMap[value] = name;
         changed = true;
       }
@@ -228,7 +228,7 @@
         var href = absoluteUrl(anchor.getAttribute("href"), location.href);
         var match = href.match(/[?&]category_id=(\d+)/);
         var subject = stripCount(elementText(anchor.querySelector("h3") || anchor));
-        if (!match || !subject) return;
+        if (!match || !subject || !isValidLargeCategory(division) || isInvalidSessionLabel(subject)) return;
         var key = match[1];
         var next = { division: division, subject: subject, categoryId: key, source: "top-category-dom" };
         if (JSON.stringify(state.categoryMap[key]) !== JSON.stringify(next)) {
@@ -258,13 +258,14 @@
       var values = groups[hrefs[index]];
       if (values.length >= 2) {
         var categoryMatch = hrefs[index].match(/[?&]category_id=(\d+)/);
-        return {
+        var found = {
           division: values[0],
           subject: values[1],
           categoryId: categoryMatch ? categoryMatch[1] : null,
           source: "montore-explicit-category-links",
           confidence: "explicit"
         };
+        if (isValidClassificationContext(found)) return found;
       }
     }
     return null;
@@ -278,7 +279,7 @@
       return null;
     }
     var categoryId = url.searchParams.get("category_id");
-    if (categoryId && state.categoryMap[categoryId]) {
+    if (categoryId && isValidClassificationContext(state.categoryMap[categoryId])) {
       return Object.assign({}, state.categoryMap[categoryId], {
         source: "top-category-map",
         confidence: "explicit"
@@ -303,7 +304,7 @@
 
     if (largeIds.length === 1) {
       var largeName = state.largeCategoryMap[largeIds[0]] || heading;
-      if (largeName) {
+      if (isValidLargeCategory(largeName)) {
         return {
           division: largeName,
           subject: "全範囲",
@@ -314,14 +315,18 @@
       }
     }
 
-    if (state.pendingContext && state.pendingContext.division && state.pendingContext.subject) {
+    if (isValidClassificationContext(state.pendingContext)) {
       return Object.assign({}, state.pendingContext, {
         source: state.pendingContext.source || "clicked-category",
         confidence: "explicit"
       });
     }
 
-    if (heading) {
+    // 「未演習 120問」等のステータス見出しから科目を推測しない。
+    // 既知の大分類と一致する場合だけ見出しを採用する。
+    if (isValidLargeCategory(heading) &&
+      (DOMAIN_BY_LARGE_CATEGORY[heading] ||
+        Object.values(state.largeCategoryMap).indexOf(heading) >= 0)) {
       return {
         division: heading,
         subject: "全範囲",
@@ -335,7 +340,7 @@
   function detectContext(doc, urlValue) {
     readLargeCategoryMaps(doc);
     var explicit = findExplicitQuestionContext(doc);
-    if (explicit) {
+    if (isValidClassificationContext(explicit)) {
       if (explicit.categoryId) {
         state.categoryMap[explicit.categoryId] = {
           division: explicit.division,
@@ -348,8 +353,11 @@
       return explicit;
     }
     var search = findSearchContext(doc, urlValue);
-    if (search) return search;
-    if (state.settings.manualDivision && state.settings.manualSubject) {
+    if (isValidClassificationContext(search)) return search;
+    if (isValidClassificationContext({
+      division: state.settings.manualDivision,
+      subject: state.settings.manualSubject
+    })) {
       return {
         division: state.settings.manualDivision,
         subject: state.settings.manualSubject,
@@ -776,10 +784,25 @@
   function isInvalidSessionLabel(value) {
     return !value || [
       "未演習",
+      "演習済み",
+      "全問題",
       "オススメのフィルタ",
       "コアカリキュラム項目",
       "科目未設定"
     ].indexOf(String(value).trim()) >= 0;
+  }
+
+  // 未演習・全範囲などの表示項目を、医学の大分類と誤認しない。
+  function isValidLargeCategory(value) {
+    var name = stripCount(value);
+    return Boolean(name && name !== "全範囲" &&
+      !isInvalidSessionLabel(name) &&
+      !/^(?:未演習|演習済み|すべて|全て|正答|誤答|間違えた問題|全範囲)\s*(?:の問題)?$/u.test(name));
+  }
+
+  function isValidClassificationContext(context) {
+    return Boolean(context && isValidLargeCategory(context.division) &&
+      context.subject && !isInvalidSessionLabel(context.subject));
   }
 
   function safeTagSegment(value) {
@@ -840,6 +863,9 @@
   }
 
   function formatClassification(largeCategory, category) {
+    if (!isValidClassificationContext({ division: largeCategory, subject: category })) {
+      return "⚠ 分類未取得";
+    }
     var classification = buildClassification(largeCategory, category);
     var label = classification.displayPath.join(" ＞ ");
     return classification.mappingStatus === "mapped" ? label : "⚠ 領域未確認｜" + label;
@@ -854,14 +880,14 @@
       return null;
     }
     var categoryId = url.searchParams.get("category_id");
-    if (categoryId && state.categoryMap[categoryId]) {
+    if (categoryId && isValidClassificationContext(state.categoryMap[categoryId])) {
       return Object.assign({}, state.categoryMap[categoryId], {
         source: "session-search-category",
         confidence: "explicit"
       });
     }
     var largeIds = url.searchParams.getAll("large_category_ids[]");
-    if (largeIds.length === 1 && state.largeCategoryMap[largeIds[0]]) {
+    if (largeIds.length === 1 && isValidLargeCategory(state.largeCategoryMap[largeIds[0]])) {
       return {
         division: state.largeCategoryMap[largeIds[0]],
         subject: "全範囲",
@@ -938,7 +964,7 @@
     if (currentSession) {
       currentSession.updatedAt = nowIso();
       var sessionSearchContext = contextFromSessionSearchUrl(currentSession);
-      if (sessionSearchContext) {
+      if (isValidClassificationContext(sessionSearchContext)) {
         currentSession.division = sessionSearchContext.division;
         currentSession.subject = sessionSearchContext.subject;
         currentSession.subjectSource = sessionSearchContext.source;
@@ -946,20 +972,23 @@
           sessionSearchContext,
           question ? question.total : currentSession.expectedTotal
         );
-      } else if (context && isInvalidSessionLabel(currentSession.division)) {
-        // v1.0系で自己評価の「未演習」を大分類として保存したセッションを補正する。
-        // 問題の第2階層を演習範囲とは決めつけず、大分類のみ採用する。
+      } else if (isValidClassificationContext(context) && !isValidClassificationContext({
+        division: currentSession.division,
+        subject: currentSession.subject
+      })) {
+        // 旧版で「未演習／全範囲」が保存されたセッションを、実測の科目情報で修復。
+        // 分野の確証がない場合は上書きしない。
         currentSession.division = context.division;
-        currentSession.subject = currentSession.subject &&
-          !isInvalidSessionLabel(currentSession.subject) ?
-          currentSession.subject : "全範囲";
+        currentSession.subject = context.subject;
         currentSession.subjectSource = "repaired-from-explicit-question-classification";
         currentSession.subjectKey = sessionSubjectKey({
           division: currentSession.division,
           subject: currentSession.subject
         }, question ? question.total : currentSession.expectedTotal);
-      } else if (context && (!currentSession.division || !currentSession.subject ||
-        currentSession.subjectSource === "unavailable")) {
+      } else if (isValidClassificationContext(context) &&
+        (!currentSession.division || !currentSession.subject ||
+        currentSession.subjectSource === "unavailable" ||
+        currentSession.subjectSource === "page-heading")) {
         currentSession.division = context.division || currentSession.division;
         currentSession.subject = context.subject || currentSession.subject;
         currentSession.subjectSource = context.source || currentSession.subjectSource;
@@ -2388,13 +2417,12 @@
     if (!ui.current) return;
     var session = currentSession;
     var question = currentQuestion;
-    var context = session && session.division && session.subject ? {
-      division: session.division,
-      subject: session.subject
-    } : (question && question.subjectContext ? {
-      division: question.subjectContext.division,
-      subject: question.subjectContext.subject
-    } : currentContext);
+    var questionContext = question && question.subjectContext;
+    var sessionContext = session ? {division:session.division, subject:session.subject} : null;
+    // 誤った旧セッションの科目名より、問題ページで明示された分類を優先。
+    var context = isValidClassificationContext(questionContext) ? questionContext :
+      isValidClassificationContext(sessionContext) ? sessionContext :
+      isValidClassificationContext(currentContext) ? currentContext : null;
     var candidateCount = session ? activeCandidatesForSession(session.id).length : 0;
     var pendingCount = session ? pendingCandidatesForSession(session.id).length : 0;
     var overrideCount = session ? state.automaticOverrides.filter(function (entry) {
@@ -2434,7 +2462,8 @@
 
   function renderSubjectFallback() {
     if (!ui.subjectFallback) return;
-    var valid = currentContext && currentContext.division && currentContext.subject;
+    var valid = isValidClassificationContext(currentContext) ||
+      (currentQuestion && isValidClassificationContext(currentQuestion.subjectContext));
     var isExerciseTop = location.pathname.replace(/\/+$/, "") === "/users/cbt" && !location.search;
     if (valid) {
       ui.subjectFallback.innerHTML = "";
@@ -2653,9 +2682,10 @@
         setTimeout(start, 80);
         return;
       }
+      // 分類取得が失敗しても同期の接続確認は生きるように先に初期化する。
+      installReviewBridge();
       readLargeCategoryMaps(document);
       currentContext = detectContext(document, location.href);
-      installReviewBridge();
       createUi();
       installObservers();
       captureCurrentQuestion();
