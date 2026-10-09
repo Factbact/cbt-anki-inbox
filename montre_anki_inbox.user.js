@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         モントレ用 Anki追加箱
 // @namespace    https://github.com/Factbact/cbt-anki-inbox
-// @version      2.5.0
+// @version      2.6.0
 // @description  モントレCBTの手動候補・自動指定・演習セッション・全問JSONを管理します
 // @author       Factbact
 // @match        https://m3e-medical.com/users/cbt*
@@ -23,7 +23,10 @@
   "use strict";
 
   var APP_NAME = "モントレ用 Anki追加箱";
-  var VERSION = "2.5.0";
+  var VERSION = "2.6.0";
+  var REVIEW_BRIDGE_KEY = "montreReview.bridge.v1";
+  var reviewPublished = {};
+  var reviewReplayActive = false;
   var STATE_KEY = "montre_anki_inbox_state_v1";
   var MAX_IMAGE_BYTES = 8 * 1024 * 1024;
   var DEFAULT_PANEL = { left: 16, top: 140, width: 380, height: 560 };
@@ -1332,6 +1335,88 @@
     return Boolean(String(text || "").trim() || (draft.images && draft.images.length));
   }
 
+
+  // モントレ誤答復習へ、確定した演習結果のみをローカルで受け渡す。
+  // GitHubや外部サーバーに問題文を送信しない。
+  function makeReviewPacket(question) {
+    if (!question || question.selfEvaluationConfirmed !== true ||
+      !/[○×△]/.test(question.selfEvaluation || "") ||
+      !Array.isArray(question.correctAnswer) || !question.correctAnswer.length ||
+      !Array.isArray(question.choices) || !question.choices.length ||
+      !String(question.questionText || "").trim()) return null;
+    return {
+      kind: "montre-review-question-v1",
+      question: {
+        problemNumber: String(question.problemNumber || ""),
+        questionText: String(question.questionText || "").slice(0, 30000),
+        choices: question.choices.slice(0, 25).map(function (c) {
+          return { label: String(c.label || ""), text: String(c.text || "").slice(0, 30000) };
+        }),
+        correctAnswer: question.correctAnswer.slice(0, 25),
+        selectedAnswer: Array.isArray(question.selectedAnswer) ? question.selectedAnswer.slice(0, 25) : [],
+        selfEvaluation: question.selfEvaluation,
+        selfEvaluationConfirmed: true,
+        selfEvaluationRaw: question.selfEvaluationRaw,
+        answerCorrectness: question.answerCorrectness,
+        explanation: String(question.explanation || "").slice(0, 30000),
+        images: Array.isArray(question.images) ? question.images.slice(0, 12).map(function (img) {
+          return { url: typeof img === "string" ? img : img && img.url || "" };
+        }).filter(function (img) { return /^https:\/\//.test(img.url); }) : [],
+        subjectContext: question.subjectContext || null,
+        url: question.url,
+        position: question.position
+      }
+    };
+  }
+
+  function publishReviewQuestion(question, force) {
+    try {
+      var packet = makeReviewPacket(question);
+      if (!packet) return;
+      var fingerprint = JSON.stringify(packet.question);
+      var id = packet.question.problemNumber;
+      if (!force && reviewPublished[id] === fingerprint) return;
+      reviewPublished[id] = fingerprint;
+      var payload = JSON.stringify(packet);
+      if (payload.length > 240000) return;
+      // ロード順が異なるときのために最後の1問のみ一時保管する。
+      try { localStorage.setItem(REVIEW_BRIDGE_KEY, payload); } catch (_err) {}
+      window.dispatchEvent(new CustomEvent("montre-review:question", { detail: payload }));
+      window.postMessage(payload, location.origin);
+    } catch (_error) {
+      // 復習連携が失敗してもAnki用問題取得を止めない。
+    }
+  }
+
+  function replayReviewCache() {
+    if (reviewReplayActive) return;
+    reviewReplayActive = true;
+    var saved = Object.values(state.questionCache || {});
+    var index = 0;
+    function batch() {
+      var end = Math.min(index + 12, saved.length);
+      for (; index < end; index += 1) publishReviewQuestion(saved[index], true);
+      if (index < saved.length) setTimeout(batch, 80);
+      else reviewReplayActive = false;
+    }
+    batch();
+  }
+
+  function installReviewBridge() {
+    window.addEventListener("montre-review:sync-request", replayReviewCache);
+    window.addEventListener("message", function (event) {
+      if (event.source !== window || event.origin !== location.origin ||
+          typeof event.data !== "string" || event.data.length > 2000) return;
+      try {
+        if (JSON.parse(event.data).kind === "montre-review-sync-request-v1") replayReviewCache();
+      } catch (_error) {}
+    });
+    try {
+      window.dispatchEvent(new CustomEvent("montre-review:anki-ready"));
+      window.postMessage(JSON.stringify({ kind: "montre-review-ready-v1" }), location.origin);
+    } catch (_error) {}
+  }
+
   function captureCurrentQuestion() {
     if (exportRunning) return;
     currentContext = detectContext(document, location.href);
@@ -1382,6 +1467,7 @@
     ensureSession(currentQuestion, currentContext, { allowCreate: true });
     state.questionCache[currentQuestion.problemNumber] = currentQuestion;
     saveState(false);
+    publishReviewQuestion(currentQuestion, false);
     scheduleRender();
   }
 
@@ -2546,6 +2632,7 @@
       readLargeCategoryMaps(document);
       currentContext = detectContext(document, location.href);
       createUi();
+      installReviewBridge();
       installObservers();
       captureCurrentQuestion();
     } catch (error) {
