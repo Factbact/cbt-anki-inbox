@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         モントレ 誤答復習（2周目・3周目）
 // @namespace    https://github.com/Factbact/cbt-anki-inbox/montre-review
-// @version      1.2.0
-// @description  モントレの抽出JSONから誤答・△を再演習。問題と復習履歴はブラウザ内のみに保存。
+// @version      1.3.0
+// @description  Anki追加箱から誤答を自動同期。選択肢別の解説・折りたたみ・分野別復習に対応。
 // @match        https://m3e-medical.com/users/cbt/*
 // @match        https://www.m3e-medical.com/users/cbt/*
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_review.user.js
@@ -18,6 +18,7 @@
 
   const STORE_KEY = 'montreReview.v1';
   const SESSION_KEY = 'montreReview.session.v1';
+  const BRIDGE_KEY = 'montreReview.bridge.v1';
   const SEED = [];
   const BAD = new Set(['×','△']);
   const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
@@ -28,6 +29,10 @@
   let filterTopic = '';
   let screen = 'home';
   let notice = '';
+  let syncReady = false;
+  let syncedCount = 0;
+  let lastSyncAt = '';
+  let syncTimer = null;
   const jsonParse = (s, fallback) => { try { return JSON.parse(s); } catch { return fallback; } };
   const esc = s => String(s ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const cleanText = x => typeof x === 'string' ? x.slice(0,30000) : '';
@@ -68,6 +73,54 @@
     store.questions[q.id] = q;
     return true;
   }
+  function queueSyncSave(){
+ if(syncTimer)return;
+ syncTimer=setTimeout(()=>{
+   syncTimer=null;
+   if(persist()&&(screen==='home'||screen==='closed'))render();
+ },400);
+}
+
+  function receiveAutoQuestion(e){
+ let payload=e&&e.detail;
+ if(typeof payload!=='string'){try{payload=localStorage.getItem(BRIDGE_KEY);}catch(_e){}}
+ if(typeof payload!=='string'||payload.length>250000)return;
+ const packet=jsonParse(payload,null);
+ if(!packet||packet.kind!=='montre-review-question-v1'||!packet.question)return;
+ const raw=packet.question;
+ if(raw.selfEvaluationConfirmed!==true||!['○','×','△'].includes(raw.selfEvaluation))return;
+ const q=normalize(raw);
+ if(!q)return;
+ const previous=store.questions[q.id], old=previous?JSON.stringify(previous):'';
+ mergeQuestion(q);
+ if(!previous||old!==JSON.stringify(store.questions[q.id])){
+   syncedCount++;lastSyncAt=new Date().toISOString();queueSyncSave();
+ }
+ try{if(localStorage.getItem(BRIDGE_KEY)===payload)localStorage.removeItem(BRIDGE_KEY);}catch(_e){}
+}
+
+  function requestAutoSync(){
+ try{window.dispatchEvent(new CustomEvent('montre-review:sync-request'));}catch(_e){}
+ try{window.postMessage(JSON.stringify({kind:'montre-review-sync-request-v1'}),location.origin);}catch(_e){}
+}
+
+  function installAutoSync(){
+ window.addEventListener('montre-review:question',receiveAutoQuestion);
+ window.addEventListener('montre-review:anki-ready',()=>{
+   syncReady=true;requestAutoSync();if(screen==='home')render();
+ });
+ window.addEventListener('message',e=>{
+   if(e.source!==window||e.origin!==location.origin||typeof e.data!=='string'||e.data.length>250000)return;
+   const packet=jsonParse(e.data,null);
+   if(packet?.kind==='montre-review-question-v1')receiveAutoQuestion({detail:e.data});
+   if(packet?.kind==='montre-review-ready-v1'&&!syncReady){
+     syncReady=true;requestAutoSync();if(screen==='home')render();
+   }
+ });
+ receiveAutoQuestion(null);
+ requestAutoSync();
+}
+
   function persist() {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); return true; }
     catch (e) {notice='保存に失敗した。ブラウザの保存容量を確認し、バックアップを出力してください。';return false;}
@@ -207,7 +260,22 @@
   .choice.wrong{background:#fdf0ef;border-color:#d99893}
   .result{border-radius:10px;padding:14px;margin:14px 0;background:#eef5fa;border:1px solid #adc8e2}
   .result.miss{background:#fff1eb;border-color:#efba9e}
-  .explanation{white-space:pre-wrap;line-height:1.8;max-height:260px;overflow:auto;border-top:1px solid #c5d3e1;padding-top:12px;margin-top:10px}
+  .explanation{white-space:pre-wrap;line-height:1.8;max-height:460px;overflow:auto;border-top:1px solid #c5d3e1;padding-top:12px;margin-top:10px}
+
+  .exp-group{display:grid;gap:9px;margin:13px 0}
+  .exp-item{border:1px solid #dce4ed;border-radius:11px;overflow:hidden;background:#fff}
+  .exp-item summary{display:flex;align-items:center;gap:11px;cursor:pointer;padding:11px 13px;font-weight:650;list-style:none}
+  .exp-item summary::-webkit-details-marker{display:none}
+  .exp-item summary:after{content:'詳細';margin-left:auto;color:#526579;font-size:12px;font-weight:400}
+  .exp-item[open] summary:after{content:'閉じる'}
+  .exp-item .exp-text{padding:0 13px 13px 45px;white-space:pre-wrap;line-height:1.9;font-size:14px;overflow-wrap:anywhere}
+  .exp-item .letter{display:inline-flex;min-width:27px;height:27px;border-radius:50%;background:#edf2f8;align-items:center;justify-content:center}
+  .exp-item.exp-correct{border-color:#a6d8bd;background:#f8fdf9}
+  .exp-item.exp-correct .letter{background:#e0f7ea;color:#176344}
+  .exp-common{border-left:3px solid #b4c6d9;background:#f7f9fc;border-radius:7px;margin:10px 0;padding:10px 13px;white-space:pre-wrap;line-height:1.85}
+  .exp-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:15px}
+  .sync-status{font-size:12px;color:#375773;margin:7px 0 12px}
+
   .images{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px}.images img{max-width:min(100%,460px);max-height:370px;object-fit:contain;border:1px solid #e1e7ef;border-radius:6px;background:white}
   .progress{height:7px;background:#e3eaf2;border-radius:5px;overflow:hidden;margin:10px 0 17px}.progress>div{height:100%;background:#3f789f}
   .link{color:#246da7;text-decoration:underline;cursor:pointer}
@@ -247,8 +315,9 @@
     const topics=topicOptions();
     const resumable=session && session.ids?.length>0;
     return `<h3>間違えた問題だけを解き直す</h3>
-      <div class="sub">${SEED.length ? '初期データ：呼吸器 128問収録済み。新しいJSONも追加可能。' : '最初に下の「JSONファイルを追加」で問題を読み込んでください。'}</div>
-      <div class="stats"><div class="stat"><b>${qs.length}</b><span>登録問題数</span></div><div class="stat"><b>${originalWrong}</b><span>初回 ×</span></div><div class="stat"><b>${originalTriangle}</b><span>初回 △</span></div><div class="stat"><b>${pending}</b><span>未克服（×・△）</span></div></div>
+      <div class="sync-status">自動同期：${syncReady?'Anki追加箱と接続中':'Anki追加箱からの応答待ち'} ／ 今回更新 ${syncedCount}問 ${lastSyncAt?'（最終 '+esc(new Date(lastSyncAt).toLocaleTimeString('ja-JP'))+'）':''} <button data-action="sync">今すぐ同期</button></div>
+      <div class="stats"><div class="stat"><b>${qs.length}</b><span>登録問題数</span></div><div class="stat"><b>${pending}</b><span>未克服</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&latest(q)==='○').length}</b><span>克服済み</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&history(q.id).length&&BAD.has(latest(q))).length}</b><span>再誤答</span></div></div>
+      <p class="sub">初回 ×：${originalWrong}問 ／ 初回 △：${originalTriangle}問 ／ 復習履歴あり：${reviewed}問</p>
       <label class="select"><span>分野</span><select id="topic-select"><option value="">全分野</option>${topics.map(t=>`<option value="${esc(t)}" ${t===filterTopic?'selected':''}>${esc(t)}</option>`).join('')}</select></label>
       <div class="card"><strong>復習を開始</strong><p class="sub">正解した問題は「未克服」のリストから外れる。△・×は残る。</p>
         <div class="actions"><button class="primary" data-action="start" data-kind="pending">未克服だけ（${getQueue('pending').length}問）</button><button data-action="start" data-kind="all-bad">初回 ×・△ 全件（${getQueue('all-bad').length}問）</button></div>
@@ -257,11 +326,66 @@
         <p class="sub">復習した問題数：${reviewed}問。1周目の正誤はインポート時の記録である。</p>
       </div>
       <div class="card"><strong>JSONの読み込み・バックアップ</strong>
-        <p class="sub">従来の「montre_anki_…json」を選択する。同じ問題番号は重複しない。問題と復習履歴はこのブラウザ内に保存する。</p>
+        <p class="sub">Anki追加箱 v2.6.0以上が有効なら、正誤判定済みの問題を自動同期する。既存のJSONも手動で追加できる。</p>
         <div class="actions"><label class="filepicker">JSONファイルを追加<input id="import-file" type="file" accept=".json,application/json" multiple></label><button data-action="backup">バックアップを書き出す</button></div>
       </div>
       <p class="sub">※モントレ本体の演習履歴や解答を変更しない。画像は、JSONに含まれる問題用画像のみ表示する。元サイトの一部機能・掲載画像はログイン状態等に依存する。</p>`;
   }
+  function parseExplanation(q){
+ const source=String(q.explanation||'').trim();
+ const labels=q.choices.map(c=>c.label).filter(x=>/^[A-Z]$/.test(x));
+ const sections=Object.fromEntries(labels.map(x=>[x,[]]));
+ if(!source||!labels.length)return{sections,common:source,structured:false};
+ const headIndex=source.search(/選択肢考察\s*[：:]/);
+ if(headIndex<0)return{sections,common:source,structured:false};
+ const start=headIndex+source.slice(headIndex).match(/^選択肢考察\s*[：:]/)[0].length;
+ const tail=source.slice(start);
+ const stop=tail.search(/(?:正解\s*[：:]?\s*[A-Z](?=\s|$|[，,。]))|(?:ポイント\s*[：:])|(?:解説\s*[：:])|(?:関連\s*[：:])/);
+ const choicePart=stop>=0?tail.slice(0,stop):tail;
+ const suffix=stop>=0?tail.slice(stop):'';
+ const prefix=source.slice(0,headIndex).trim();
+ const allowed=labels.join('');
+ const found=[...choicePart.matchAll(new RegExp('([○×])\\s*(['+allowed+'])(?=[\\s　，,。、：:]|$)','g'))];
+ if(!found.length)return{sections,common:source,structured:false};
+ const common=[prefix].filter(Boolean);
+ const colonMarkers=[...choicePart.matchAll(new RegExp('(?:^|[\\s　])(['+allowed+'])[：:]','g'))];
+ if(colonMarkers.length>=2){
+   const pre=choicePart.slice(0,colonMarkers[0].index).replace(/^[\s　，,○×A-Z]+/,'').trim();
+   if(pre)common.push(pre);
+   colonMarkers.forEach((m,i)=>{
+     const seg=choicePart.slice(m.index+m[0].length,i+1<colonMarkers.length?colonMarkers[i+1].index:choicePart.length).trim();
+     if(seg&&sections[m[1]])sections[m[1]].push(seg);
+   });
+ }else{
+   found.forEach((m,i)=>{
+     const seg=choicePart.slice(m.index+m[0].length,i+1<found.length?found[i+1].index:choicePart.length).trim().replace(/^[　\s，,：:]+/,'');
+     if(seg&&!/^[，,、\s　]*$/.test(seg)){
+       if(/^([，,、]|$)/.test(choicePart.slice(m.index+m[0].length,m.index+m[0].length+1)))return;
+       sections[m[2]].push(seg);
+     }
+   });
+   const first=choicePart.slice(0,found[0].index).trim();
+   if(first)common.push(first);
+ }
+ if(suffix)common.push(suffix);
+ const structured=Object.values(sections).some(v=>v.length);
+ return structured?{sections,common:common.filter(Boolean).join('\n\n'),structured:true}:{sections,common:source,structured:false};
+}
+  function explanationHtml(q){
+ if(!q.explanation)return'<p class="sub">この問題には解説が保存されていない。</p>';
+ const parsed=parseExplanation(q);
+ if(!parsed.structured)return`<div class="explanation">${esc(parsed.common)}</div>`;
+ const items=q.choices.map(c=>{
+   const desc=(parsed.sections[c.label]||[]).join('\n\n');
+   const correct=q.answer.includes(c.label);
+   return `<details class="exp-item ${correct?'exp-correct':''}" ${correct?'open':''}>
+      <summary><span class="letter">${esc(c.label)}</span><span>${correct?'○':'×'} ${esc(c.text)}</span></summary>
+      <div class="exp-text">${desc?esc(desc):'この選択肢固有の解説はない（共通解説を確認）。'}</div></details>`;
+ }).join('');
+ return `<div class="exp-toolbar"><strong>選択肢ごとの解説</strong><button data-action="expand-explanations">すべて展開</button></div>
+    <div class="exp-group">${items}</div>${parsed.common?`<div class="exp-common"><strong>補足・共通解説</strong>\n${esc(parsed.common)}</div>`:''}
+    <details><summary>解説の原文を表示</summary><div class="explanation">${esc(q.explanation)}</div></details>`;
+}
   function quizHtml() {
     const q=currentQ();
     if(!q){screen='end';return endHtml();}
@@ -278,7 +402,7 @@
         <input type="${q.answer.length>1?'checkbox':'radio'}" name="ans" value="${esc(c.label)}" ${selected.has(c.label)?'checked':''} ${ansChecked?'disabled':''}>
         <span class="letter">${esc(c.label)}</span><span>${esc(c.text)}</span></label>`).join('')}</div>
       ${ansChecked?`<section class="result ${checkedResult.ok?'':'miss'}"><strong>${checkedResult.ok?'正解':'不正解'}　／　復習判定：${esc(checkedResult.mark)}</strong><div>正答：${esc(q.answer.join('・'))}</div>
-        ${q.explanation?`<div class="explanation">${esc(q.explanation)}</div>`:'<p class="sub">このJSONに解説はない。</p>'}
+        ${explanationHtml(q)}
         <div class="actions"><button data-action="mark" data-mark="△">△として残す</button><button data-action="mark" data-mark="×">×として残す</button><button data-action="mark" data-mark="○">○で定着</button></div></section>`:''}
       <div class="actions">${!ansChecked?'<button class="primary" data-action="check">解答して判定</button>':''}
         <button data-action="prev" ${index===1?'disabled':''}>前の問題</button><button class="primary" data-action="next">${index===n?'復習を終了':'次の問題'}</button></div>
@@ -305,6 +429,8 @@
     else if(a==='check'){check();}
     else if(a==='mark'){const q=currentQ();if(q && checkedResult){updateLast(q,btn.dataset.mark);render();}}
     else if(a==='backup'){downloadBackup();}
+    else if(a==='sync'){syncReady=false;requestAutoSync();notice='Anki追加箱の取得済み問題を再確認しています。';render();}
+    else if(a==='expand-explanations'){const details=[...shadow.querySelectorAll('.exp-group details')];const expand=details.some(d=>!d.open);details.forEach(d=>d.open=expand);btn.textContent=expand?'すべて閉じる':'すべて展開';}
   }
   function handleChange(e) {
     const el=e.target;
@@ -331,5 +457,6 @@
     }
   }
   init();screen='closed';
+  installAutoSync();
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',mount,{once:true});else mount();
 })();
