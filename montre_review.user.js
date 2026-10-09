@@ -91,6 +91,7 @@
  if(raw.selfEvaluationConfirmed!==true||!['○','×','△'].includes(raw.selfEvaluation))return;
  const q=normalize(raw);
  if(!q)return;
+ syncReady=true;
  const previous=store.questions[q.id], old=previous?JSON.stringify(previous):'';
  mergeQuestion(q);
  if(!previous||old!==JSON.stringify(store.questions[q.id])){
@@ -349,6 +350,12 @@
  if(!found.length)return{sections,common:source,structured:false};
  const common=[prefix].filter(Boolean);
  const colonMarkers=[...choicePart.matchAll(new RegExp('(?:^|[\\s　])(['+allowed+'])[：:]','g'))];
+ if(colonMarkers.length<2&&found.length>=3){
+   const markerHead=choicePart.slice(0,found[found.length-1].index+found[found.length-1][0].length);
+   if(!markerHead.replace(/([○×])\s*[A-Z]/g,'').replace(/[，,、\s　]/g,'')){
+     return{sections,common:source,structured:false};
+   }
+ }
  if(colonMarkers.length>=2){
    const pre=choicePart.slice(0,colonMarkers[0].index).replace(/^[\s　，,○×A-Z]+/,'').trim();
    if(pre)common.push(pre);
