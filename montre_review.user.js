@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         モントレ 誤答復習（2周目・3周目）
 // @namespace    https://github.com/Factbact/cbt-anki-inbox/montre-review
-// @version      1.3.0
+// @version      1.4.0
 // @description  Anki追加箱から誤答を自動同期。選択肢別の解説・折りたたみ・分野別復習に対応。
-// @match        https://m3e-medical.com/users/cbt/*
-// @match        https://www.m3e-medical.com/users/cbt/*
+// @match        https://m3e-medical.com/users/cbt*
+// @match        https://www.m3e-medical.com/users/cbt*
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_review.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/montre_review.user.js
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
@@ -299,11 +299,11 @@
   }
   function render() {
     if(!app)return;
-    if(screen==='closed'){app.innerHTML=`<button id="launcher" data-action="open">誤答復習を開く</button>`;return;}
+    if(screen==='closed'){app.innerHTML=`<button id="launcher" data-action="open">誤答復習 v1.4（同期はこちら）</button>`;return;}
     const body=screen==='home'?homeHtml():screen==='quiz'?quizHtml():endHtml();
     app.innerHTML=`<button id="launcher" data-action="toggle" style="display:none">誤答復習</button>
       <div id="backdrop"><section id="modal" role="dialog" aria-modal="true" aria-label="モントレ誤答復習">
-      <header class="top"><h2>モントレ 誤答復習</h2><small>ブラウザ内で保存</small><button data-action="home" aria-label="ホーム">一覧</button><button data-action="close" aria-label="閉じる">✕</button></header>
+      <header class="top"><h2>モントレ 誤答復習 v1.4</h2><small>ブラウザ内で保存</small><button data-action="home" aria-label="ホーム">一覧</button><button data-action="close" aria-label="閉じる">✕</button></header>
       <main>${notice?`<div class="notice">${esc(notice)}</div>`:''}${body}</main></section></div>`;
     notice='';
   }
@@ -316,7 +316,7 @@
     const topics=topicOptions();
     const resumable=session && session.ids?.length>0;
     return `<h3>間違えた問題だけを解き直す</h3>
-      <div class="sync-status">自動同期：${syncReady?'Anki追加箱と接続中':'Anki追加箱からの応答待ち'} ／ 今回更新 ${syncedCount}問 ${lastSyncAt?'（最終 '+esc(new Date(lastSyncAt).toLocaleTimeString('ja-JP'))+'）':''} <button data-action="sync">今すぐ同期</button></div>
+      <div class="sync-status">自動同期：${syncReady?'Anki追加箱と接続中':'Anki追加箱からの応答待ち'} ／ 今回更新 ${syncedCount}問 ${lastSyncAt?'（最終 '+esc(new Date(lastSyncAt).toLocaleTimeString('ja-JP'))+'）':''} <button data-action="sync">Ankiから同期</button></div>
       <div class="stats"><div class="stat"><b>${qs.length}</b><span>登録問題数</span></div><div class="stat"><b>${pending}</b><span>未克服</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&latest(q)==='○').length}</b><span>克服済み</span></div><div class="stat"><b>${qs.filter(q=>isBad(q)&&history(q.id).length&&BAD.has(latest(q))).length}</b><span>再誤答</span></div></div>
       <p class="sub">初回 ×：${originalWrong}問 ／ 初回 △：${originalTriangle}問 ／ 復習履歴あり：${reviewed}問</p>
       <label class="select"><span>分野</span><select id="topic-select"><option value="">全分野</option>${topics.map(t=>`<option value="${esc(t)}" ${t===filterTopic?'selected':''}>${esc(t)}</option>`).join('')}</select></label>
