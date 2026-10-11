@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.9
+// @version      6.10
 // @description  CBT Medilink専用。移動・サイズ調整できる追加箱。演習情報をコンパクト表示し、産婦人科の分類を補正。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
@@ -5215,6 +5215,62 @@
         outline: 3px solid #2563eb;
         outline-offset: 2px;
       }
+
+      /* v6.10: Montre-inspired blue palette; geometry and behavior stay unchanged. */
+      #panel {
+        background: #f7fbff; color: #17324d;
+        box-shadow: 0 12px 35px rgba(18,54,86,.28), 0 0 0 1px #8bc8e8;
+      }
+      #main-button, #inbox-pinned-header, #save-candidate {
+        background: linear-gradient(135deg, #0756d8, #087e99);
+        color: #fff;
+      }
+      #inbox-pinned-header { border-bottom-color: #8bc8e8; }
+      #inbox-pinned-header .title, #inbox-pinned-header .count-row,
+      #close-panel { color: #fff; }
+      #inbox-reset-position {
+        background: rgba(255,255,255,.14); color: #fff;
+        border-color: rgba(255,255,255,.6);
+      }
+      #inbox-reset-position:hover, #close-panel:hover { background: rgba(255,255,255,.22); }
+      #run-qb-exporter {
+        background: #e8f6ff; color: #064f80; border-color: #b9e3f7;
+      }
+      #run-qb-exporter:hover { background: #fff; border-color: #fff; }
+      #inbox-pinned-footer { background: #edf7fd; border-top-color: #c4dfef; }
+      #save-candidate:hover, #main-button:hover {
+        background: linear-gradient(135deg, #064ab9, #086d84);
+      }
+      #panel-content { background: #f7fbff; scrollbar-color: #8bbbd5 #edf5fa; }
+      #panel-content label, .candidate-section-title { color: #075b8b; }
+      #panel input, #panel select, #panel textarea {
+        color: #17324d; background: #fff; border-color: #91b9d2;
+        accent-color: #0756d8;
+      }
+      #panel input::placeholder, #panel textarea::placeholder { color: #586f82; opacity: 1; }
+      #panel input:focus-visible, #panel select:focus-visible, #panel textarea:focus-visible,
+      #panel summary:focus-visible, #drop-zone:focus-visible {
+        outline: 2px solid #0756d8; outline-offset: 2px;
+      }
+      #inbox-pinned-header button:focus-visible { outline-color: #fff; }
+      #inbox-context-details { background: #eaf5fc; border-color: #c4dfef; }
+      #inbox-context-details > summary, #inbox-card-options > summary { color: #075b8b; }
+      #inbox-context-details > summary:hover, #inbox-card-options > summary:hover { color: #043b61; }
+      #drop-zone { background: #edf8ff; color: #365f79; border-color: #6babc9; }
+      #drop-zone:hover, #drop-zone.dragging { background: #dcefff; border-color: #0756d8; color: #064f80; }
+      #capture-current, #settings-toggle {
+        background: #e1f3fb; border-color: #b4d9ec; color: #075b8b;
+      }
+      #capture-current:hover, #settings-toggle:hover { background: #cfeaf8; }
+      .memory-note, .manual-auto-help, .candidate-meta, .id-note,
+      .candidate-section-count, .exercise-label, #exercise-meta, #exercise-stats {
+        color: #526b80;
+      }
+      .candidate-card { background: #fff; border-color: #c4dfef; }
+      .candidate-text, #exercise-title { color: #17324d; }
+      .history-group { background: #f0f7fc; border-color: #c4dfef; }
+      .exercise-box, #question-box { background: #edf7fd; border-color: #c4dfef; }
+      /* Amber warnings, red deletion controls and selected-state badges retain their meaning. */
     `;
 
     const top = document.createElement("div");
