@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.8
+// @version      6.9
 // @description  CBT Medilink専用。移動・サイズ調整できる追加箱。演習情報をコンパクト表示し、産婦人科の分類を補正。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
@@ -2926,11 +2926,27 @@
     id="memory-text"
     placeholder="例：アスベスト小体を画像で見分ける"
   ></textarea>
-  <div class="memory-note">
-    ※ 1行＝1候補。改行すると別のカード候補として保存されます。<br>
-    ※ 未保存の内容がある状態で「次の問題」を押すと、自動保存してから進みます。
+  <div class="memory-note" title="未保存の内容は「次の問題」を押すと自動保存します。">1行＝1候補・次の問題へ進むと自動保存</div>
+
+  <label>画像・文字</label>
+
+  <div id="drop-zone" tabindex="0" title="クリックしてから ⌘V / Ctrl+V でも貼り付けできます">
+    画像・文字をドロップ<br>
+    またはクリックして ⌘V / Ctrl+V
   </div>
 
+  <div id="image-preview-area"></div>
+
+  <button id="save-candidate" class="primary">
+    ＋ 候補に追加
+  </button>
+
+  <button id="capture-current" class="secondary">
+    選択中の文字・画像を取り込む
+  </button>
+
+  <details id="inbox-card-options">
+    <summary>自動カード設定・使い方</summary>
   <label class="checkbox-row manual-auto-option">
     <input id="also-automatic" type="checkbox">
     <span>この問題は自動カードも作る</span>
@@ -2946,25 +2962,8 @@
     手動候補なしでも使えます。押した問題は評価に関係なく自動カードを1枚作成。もう一度押すと解除。
   </div>
 
-  <label>画像・文字</label>
-
-  <div id="drop-zone" tabindex="0" title="クリックしてから ⌘V / Ctrl+V でも貼り付けできます">
-    画像や文字を<br>
-    ドラッグ＆ドロップ<br><br>
-    または<br>
-    クリックして ⌘V / Ctrl+V で貼り付け<br>
-    選択文字／画像上で ⌥A
-  </div>
-
-  <div id="image-preview-area"></div>
-
-  <button id="save-candidate" class="primary">
-    ＋ 候補に追加
-  </button>
-
-  <button id="capture-current" class="secondary">
-    選択中の文字・画像を取り込む
-  </button>
+    <div class="memory-note">選択文字・画像の取り込み：⌥A / Alt+A</div>
+  </details>
 
   <div class="candidate-section-title">
     <span>この演習の候補</span>
@@ -5106,7 +5105,7 @@
     details.append(summary);
     content.insertBefore(details, exercise);
     details.append(exercise, destination);
-    for (const id of ["settings-toggle", "settings-body"]) {
+    for (const id of ["question-box", "settings-toggle", "settings-body"]) {
       const element = root.getElementById(id);
       if (element) details.append(element);
     }
@@ -5199,6 +5198,19 @@
         background: #fff7ed; color: #9a3412; font-size: 12px;
       }
       #inbox-context-warning[hidden] { display: none; }
+
+      #inbox-pinned-header, #inbox-pinned-footer { padding: 9px 14px; }
+      #inbox-pinned-header .count-row { font-size: 11px; line-height: 1.4; margin-bottom: 6px; }
+      #panel-content { padding: 8px 14px; }
+      #panel-content > label { margin-top: 6px; margin-bottom: 4px; }
+      #memory-text { min-height: 64px; height: 72px; margin-bottom: 6px; }
+      .memory-note { margin: 0 0 6px; font-size: 10px; }
+      #drop-zone { min-height: 54px; padding: 6px 8px; margin-top: 0; font-size: 12px; }
+      #image-preview-area:empty { margin-top: 0; }
+      #capture-current { padding: 6px 8px; font-size: 12px; }
+      #inbox-card-options { margin-top: 8px; font-size: 12px; }
+      #inbox-card-options > summary { cursor: pointer; padding: 6px 0; color: #475569; }
+      #inbox-card-options[open] { padding-bottom: 6px; }
       button:focus-visible {
         outline: 3px solid #2563eb;
         outline-offset: 2px;
@@ -5217,6 +5229,15 @@
     root.getElementById("close-panel")?.setAttribute("aria-label", "パネルを閉じる");
     installFloatingPanel(root, panel, header);
     installCompactSummary(root);
+    // Opening the panel returns to the input fields instead of the previous list scroll.
+    let wasOpen = panel.classList.contains("open");
+    const openingObserver = new MutationObserver(() => {
+      const isOpen = panel.classList.contains("open");
+      if (isOpen && !wasOpen) content.scrollTop = 0;
+      wasOpen = isOpen;
+    });
+    openingObserver.observe(panel, {attributes: true, attributeFilter: ["class"]});
+    content.scrollTop = 0;
   }
 
   pinInboxActions();
