@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.5
-// @description  CBT Medilink専用。QB全問取得時に、回答前の最新履歴を保存して△/×判定の上書きを防ぐ。
+// @version      6.6
+// @description  CBT Medilink専用。回答前履歴の保護を維持し、全問取得・候補追加ボタンをスクロール領域の外に固定。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @match        https://cbt.medilink-study.com/*
@@ -235,4 +235,76 @@
   console.info(
     "[CBT Anki v6.5] 回答前履歴保存 + △SVG祖先探索hotfixを有効化しました。"
   );
+})();
+
+
+// v6.6: Keep frequent actions outside the scrolling content.
+// Move existing elements so their event handlers and state remain intact.
+(() => {
+  "use strict";
+
+  function pinInboxActions() {
+    const root = document.getElementById("cbt-anki-root-v62")?.shadowRoot;
+    if (!root || root.getElementById("inbox-pinned-style")) return;
+    const panel = root.getElementById("panel");
+    const content = root.getElementById("panel-content");
+    const header = root.querySelector(".header");
+    const counts = root.querySelector(".count-row");
+    const exporter = root.getElementById("run-qb-exporter");
+    const save = root.getElementById("save-candidate");
+    if (!panel || !content || !header || !counts || !exporter || !save) return;
+
+    const style = document.createElement("style");
+    style.id = "inbox-pinned-style";
+    style.textContent = `
+      #panel { height: min(720px, calc(100vh - 90px)); }
+      #panel.open { display: flex; flex-direction: column; }
+      #panel-content {
+        flex: 1 1 auto;
+        min-height: 0;
+        height: auto;
+        max-height: none;
+        padding: 12px 16px;
+        border-radius: 0;
+        overscroll-behavior: contain;
+      }
+      #inbox-pinned-header, #inbox-pinned-footer {
+        flex: 0 0 auto;
+        padding: 12px 16px;
+        background: #fff;
+      }
+      #inbox-pinned-header {
+        border-radius: 15px 15px 0 0;
+        border-bottom: 1px solid #e5e7eb;
+      }
+      #inbox-pinned-footer {
+        border-radius: 0 0 15px 15px;
+        border-top: 1px solid #e5e7eb;
+      }
+      #inbox-pinned-header .count-row { margin-bottom: 8px; }
+      #inbox-pinned-header .run-qb,
+      #inbox-pinned-footer .primary { margin-top: 0; }
+      button:focus-visible {
+        outline: 3px solid #2563eb;
+        outline-offset: 2px;
+      }
+    `;
+
+    const top = document.createElement("div");
+    top.id = "inbox-pinned-header";
+    const bottom = document.createElement("div");
+    bottom.id = "inbox-pinned-footer";
+    top.append(header, counts, exporter);
+    bottom.append(save);
+    panel.insertBefore(top, content);
+    panel.append(bottom);
+    root.append(style);
+    root.getElementById("close-panel")?.setAttribute("aria-label", "パネルを閉じる");
+  }
+
+  pinInboxActions();
+  // The base script can create/recreate its shadow host after page navigation.
+  // Document observation does not include mutations inside the shadow root.
+  const observer = new MutationObserver(pinInboxActions);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
