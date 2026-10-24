@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.0
-// @description  QB CBTの評価を安全に自動判定。△は別の学習日で3連続正解なら○、◎保持、自信なし・取り消し対応。
+// @version      0.4.1
+// @description  すっきりした操作パネルで、QB CBTの評価を自動判定。異なる学習日で3回の連続正解・自信なし・取り消し対応。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -12,7 +12,7 @@
 // ==/UserScript==
 
 /*
- * QB CBT 復習ラベル管理 0.4.0
+ * QB CBT 復習ラベル管理 0.4.1
  *
  * ■ スマートモード（手動で有効化、初期値OFF）
  *   前回 ◎/○/△/× と今回の正解/不正解で評価を更新。
@@ -462,6 +462,12 @@
     const counter=record?.label==='△'||before.label==='△';
     const count=record?.label===before.label?(record?.streak||0):(before.streak||0);
     const legacy=record?.legacyStreak||0;
+    // 通常表示は必要な数字だけ。細かい説明は「判定の詳細」に格納する。
+    const shownLabel=before.label||record?.label||'—';
+    sh.getElementById('smartLabel').textContent=shownLabel;
+    sh.getElementById('smartLabel').dataset.label=shownLabel;
+    sh.getElementById('smartStreak').textContent=shownLabel==='△'?`${count} / 3`:'—';
+    sh.getElementById('progressFill').style.width=shownLabel==='△'?`${Math.min(100,count/3*100)}%`:'0%';
     el.textContent=`記録：${before.label||'不明'}${counter?` ／ 正解加算 ${count}/3日`:''}`+
       `${record?.lastCreditDay?` ／ 最終加算日 ${record.lastCreditDay}`:''}`+
       `${legacy?` ／ 旧版${legacy}回（日付不明・昇格に使わない）`:''}`+
@@ -625,16 +631,19 @@
     if (!info) return;
     info.textContent = message;
     info.dataset.type = type;
+    info.title = message; // 省略表示された通常メッセージはホバーで全文を確認できる。
   }
   function refreshUI() {
     if (!ui) return;
     const sh = ui.shadow;
     sh.getElementById('mode').value = config.mode;
     sh.getElementById('main').hidden = config.collapsed;
-    sh.getElementById('toggle').textContent = config.collapsed ? '展開' : '畳む';
+    sh.getElementById('toggle').textContent = config.collapsed ? '開く' : '閉じる';
+    sh.getElementById('toggle').setAttribute('aria-expanded', String(!config.collapsed));
     const smart=config.mode==='smart';
     sh.getElementById('fixedSettings').hidden=smart || config.mode==='off';
     sh.getElementById('smartSettings').hidden=!smart;
+    sh.getElementById('hint').hidden = smart || config.mode==='off';
     sh.getElementById('hint').textContent=smart
       ? '△は異なる学習日の正解3回で○。同日1回のみ加算、◎は維持。判定できない場合は何もしない。'
       : config.mode==='off'?'OFF：QB標準の評価動作。':'△・×が混在する演習では固定モードを使用しない。';
@@ -647,7 +656,8 @@
     sh.getElementById('train').disabled = config.mode === 'off';
     sh.getElementById('forget').disabled = config.mode === 'off' || !learned;
     sh.getElementById('apply').disabled = config.mode === 'off';
-    sh.getElementById('modeName').textContent = config.mode === 'off' ? 'OFF' : smart ? '自動' : `${LABELS[config.mode]}固定`;
+    sh.getElementById('modeName').textContent = config.mode === 'off' ? 'OFF' : smart ? '自動ON' : `${LABELS[config.mode]}固定`;
+    sh.getElementById('modeName').dataset.mode = config.mode;
   }
 
   // 右上を初期位置にし、移動した位置は画面内へ補正して復元する。
@@ -679,66 +689,88 @@
       <style>
         :host {all:initial;color-scheme:light;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif}
         * {box-sizing:border-box}
-        #panel {width:286px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);background:#fff;color:#17212e;border:1px solid #a8b7c8;border-radius:12px;box-shadow:0 5px 24px rgba(0,0,0,.18);overflow:hidden}
-        #top {display:flex;align-items:center;gap:7px;padding:9px 11px;background:#f1f5f9;border-bottom:1px solid #dae2ea;cursor:grab;touch-action:none;user-select:none}
+        [hidden] {display:none!important}
+        #panel {width:304px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 8px 26px rgba(15,23,42,.16);overflow:hidden}
+        #top {display:flex;align-items:center;gap:8px;padding:10px 12px;background:#f8fafc;border-bottom:1px solid #e2e8f0;cursor:grab;touch-action:none;user-select:none}
         #top:active {cursor:grabbing}
-        #title {flex:1;font-size:13px;font-weight:700}
-        #dragHint {font-size:12px;color:#64748b}
-        #modeName {padding:2px 6px;border-radius:6px;background:#dce7f2;color:#134268;font-weight:700;font-size:11px}
+        #title {flex:1;font-weight:750;font-size:13px;letter-spacing:.01em;color:#0f172a}
+        #modeName {padding:3px 7px;border-radius:6px;background:#e2e8f0;color:#334155;font-weight:700;font-size:11px;white-space:nowrap}
+        #modeName[data-mode="smart"] {background:#dbeafe;color:#1e40af}
+        #modeName[data-mode="triangle"],#modeName[data-mode="wrong"] {background:#eef2ff;color:#3730a3}
         button,select {font:inherit}
-        button {border:1px solid #b8c5d2;background:#fff;color:#263a52;border-radius:7px;cursor:pointer;padding:5px 7px}
-        button:hover:not(:disabled) {background:#e7edf4}
-        button:disabled {opacity:.42;cursor:not-allowed}
-        #toggle {font-size:11px;padding:2px 5px}
-        #main {padding:10px 11px 11px;max-height:calc(100vh - 88px);overflow:auto}
-        label {display:block;font-weight:600;margin-bottom:3px}
-        select {width:100%;height:34px;padding:5px 7px;border:1px solid #a7b4c5;border-radius:7px;color:#152334;background:white}
-        #hint {font-size:11px;color:#6a4d19;background:#fff5d7;border-radius:6px;padding:6px;margin-top:7px}
+        button {border:1px solid #cbd5e1;background:#fff;color:#1e293b;border-radius:8px;cursor:pointer;padding:7px 10px;font-weight:600;transition:background .12s,border-color .12s}
+        button:hover:not(:disabled) {background:#f1f5f9;border-color:#94a3b8}
+        button:focus-visible,select:focus-visible,summary:focus-visible {outline:2px solid #2563eb;outline-offset:2px}
+        button:disabled {opacity:.45;cursor:not-allowed}
+        #toggle {font-size:11px;padding:3px 7px;font-weight:600}
+        #main {padding:12px;max-height:calc(100vh - 82px);overflow:auto}
+        label {display:block;font-size:12px;font-weight:700;color:#334155;margin:0 0 5px}
+        select {width:100%;height:36px;padding:5px 9px;border:1px solid #94a3b8;border-radius:8px;color:#0f172a;background:#fff}
+        #hint {font-size:11px;color:#854d0e;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:7px 9px;margin-top:10px}
+        #smartSettings {margin-top:12px}
+        #smartCard {display:flex;gap:12px;align-items:center;padding:12px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc}
+        .scoreBlock {min-width:75px}
+        .caption {font-size:11px;font-weight:600;color:#475569}
+        #smartLabel {font-weight:760;font-size:28px;line-height:1.2;color:#1d4ed8;display:block;margin:3px 0 0}
+        #smartLabel[data-label="×"] {color:#b91c1c}
+        #smartLabel[data-label="△"] {color:#92400e}
+        #smartLabel[data-label="◎"] {color:#1e40af}
+        #smartLabel[data-label="—"] {color:#64748b}
+        .scoreRight {min-width:0;flex:1;border-left:1px solid #d6dee8;padding-left:12px}
+        #smartStreak {font-weight:750;font-size:17px;color:#0f172a;display:block;margin-top:3px;font-variant-numeric:tabular-nums}
+        .track {height:5px;border-radius:20px;background:#e2e8f0;margin-top:7px;overflow:hidden}
+        #progressFill {display:block;height:100%;width:0;background:#2563eb;border-radius:20px;transition:width .2s}
+        #smartActions {display:flex;gap:8px;margin-top:10px}
+        #smartActions button {flex:1;min-width:0;padding:9px 6px;font-size:12px}
+        #unsure:not(:disabled) {border-color:#d97706;color:#92400e;background:#fffbeb}
+        #unsure:hover:not(:disabled) {background:#fef3c7}
+        #status {margin-top:11px;padding:8px 10px;border-radius:8px;background:#f1f5f9;color:#334155;font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+        #status[data-type="ok"] {background:#f0fdf4;color:#166534}
+        #status[data-type="warn"] {background:#fffbeb;color:#92400e;border:1px solid #fcd34d}
+        #status[data-type="error"] {background:#fef2f2;color:#991b1b;border:1px solid #fecaca}
+        #status:not([data-type="warn"]):not([data-type="error"]) {display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+        details {margin-top:10px}
+        summary {color:#475569;font-size:12px;font-weight:650;cursor:pointer;padding:4px 0;user-select:none}
+        summary:hover {color:#1d4ed8}
+        .detailsContent {margin-top:5px;padding:9px 10px;border:1px solid #e2e8f0;border-radius:8px;background:#fff}
+        #smartNow,#smartReason {font-size:11px;color:#334155;line-height:1.6;overflow-wrap:anywhere}
+        #smartReason {margin-top:6px}
+        .small {font-size:11px;line-height:1.55;color:#475569}
+        .compact {display:flex;gap:6px;margin-top:8px}
+        .compact select {width:auto;flex:1;min-width:0}
+        .compact button {font-size:11px;padding:6px 7px}
         #learned {font-size:11px;color:#475569;margin-top:8px}
-        #buttons {display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
-        #train {flex:1;font-weight:700}
-        #apply {flex:1}
-        #forget {font-size:11px}
-        #resetPosition {margin-top:6px;font-size:11px;width:100%}
-        #status {margin-top:8px;min-height:31px;border-top:1px solid #e3e9f0;padding-top:6px;font-size:11px;color:#34485e;overflow-wrap:anywhere}
-        #status[data-type=ok] {color:#0a6941}
-        #status[data-type=warn] {color:#9a4b07}
-        #status[data-type=error] {color:#9a2828}
-        #foot {font-size:10px;color:#64748b;margin-top:5px}
-        #smartNow {font-size:11px;color:#334155;margin-top:6px;overflow-wrap:anywhere}
-        #smartReason {font-size:11px;color:#5c4765;margin-top:5px;overflow-wrap:anywhere}
-        #smartActions {display:flex;gap:5px;margin-top:8px}
-        #smartActions button {flex:1;font-size:11px}
-        details {margin-top:8px;border-top:1px solid #dfe7f0;padding-top:6px}
-        summary {font-size:11px;font-weight:700;cursor:pointer}
-        .small {font-size:11px;line-height:1.45;color:#64748b}
-        .compact {display:flex;gap:5px;margin-top:5px}
-        .compact select {width:auto;min-width:0;flex:1}
-        .compact button {font-size:11px}
-
+        #buttons {display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+        #buttons button {font-size:11px;flex:1}
+        #resetPosition {width:100%;font-size:11px;margin-top:8px}
+        #foot {font-size:11px;color:#475569;line-height:1.5;margin-top:8px}
       </style>
-      <section id="panel" aria-label="QB CBT 復習ラベル固定">
-        <div id="top" title="このバーをドラッグして移動"><span id="title">QB CBT 復習ラベル固定</span><span id="dragHint" aria-hidden="true">↕</span><span id="modeName">OFF</span><button id="toggle" type="button">畳む</button></div>
+      <section id="panel" aria-label="QB CBT 復習ラベル管理">
+        <div id="top" title="ドラッグして移動"><span id="title">QB 復習アシスト</span><span id="modeName">OFF</span><button id="toggle" type="button" aria-expanded="true">閉じる</button></div>
         <div id="main">
-          <label for="mode">評価を固定する復習</label>
-          <select id="mode"><option value="off">OFF（通常のQB動作）</option><option value="smart">自動評価（◎・○・△・×を判定）</option><option value="triangle">△だけを復習 → △固定</option><option value="wrong">×だけを復習 → ×固定</option></select>
-          <div id="hint"></div>
-          <div id="learned"></div>
+          <label for="mode">動作モード</label>
+          <select id="mode"><option value="off">OFF（QBの通常動作）</option><option value="smart">自動判定（おすすめ）</option><option value="triangle">△を固定</option><option value="wrong">×を固定</option></select>
+          <div id="hint" hidden></div>
           <div id="smartSettings" hidden>
-            <div id="smartNow"></div>
-            <div id="smartReason" role="status" aria-live="polite"></div>
-            <div id="smartActions"><button id="unsure" type="button" disabled>自信なし → △</button><button id="undo" type="button" disabled>自動評価を取り消す</button></div>
-            <details><summary>履歴・前回評価を補正（詳細）</summary>
-              <div class="small">前回評価が検出できない問題はQBの評価を変更しない。確実にわかる場合だけ手動登録できる。</div>
-              <div class="compact"><select id="setPrevious"><option value="">前回評価を指定</option><option value="◎">◎</option><option value="○">○</option><option value="△">△</option><option value="×">×</option><option value="未演習">未演習</option></select><button id="savePrevious" type="button">登録</button></div>
-              <div class="compact"><button id="exportHistory" type="button">履歴を書き出す</button><button id="importHistory" type="button">履歴を読み込む</button><input id="historyFile" type="file" accept=".json,application/json" hidden /></div>
-              <div class="small">QBの評価自体はQB側で同期される。ツール独自の正解加算日・連続回数は同期されない。異なるPCで続ける場合は必要に応じJSONで引き継ぐ。</div>
-            </details>
+            <div id="smartCard" aria-label="現在の評価と連続正解回数">
+              <div class="scoreBlock"><span class="caption">現在の評価</span><strong id="smartLabel">—</strong></div>
+              <div class="scoreRight"><span class="caption">連続正解</span><strong id="smartStreak">—</strong><div class="track" aria-hidden="true"><span id="progressFill"></span></div></div>
+            </div>
+            <div id="smartActions"><button id="unsure" type="button" disabled>自信なし</button><button id="undo" type="button" disabled>取り消す</button></div>
+            <details id="reasonDetails"><summary>判定の詳細</summary><div class="detailsContent"><div id="smartNow"></div><div id="smartReason" role="status"></div></div></details>
+            <details id="historyDetails"><summary>履歴と前回評価の修正</summary><div class="detailsContent">
+              <div class="small">前回の評価が確実にわかる場合だけ手動登録する。</div>
+              <div class="compact"><select id="setPrevious" aria-label="前回評価"><option value="">前回評価を選択</option><option value="◎">◎</option><option value="○">○</option><option value="△">△</option><option value="×">×</option><option value="未演習">未演習</option></select><button id="savePrevious" type="button">登録</button></div>
+              <div class="compact"><button id="exportHistory" type="button">履歴を保存</button><button id="importHistory" type="button">履歴を読込</button><input id="historyFile" type="file" accept=".json,application/json" hidden /></div>
+              <p class="small">QBの評価はQB側で同期される。連続正解回数・正解日はブラウザごとに保存される。</p>
+            </div></details>
           </div>
-          <div id="fixedSettings"><div id="buttons"><button id="train" type="button">ボタン位置を登録</button><button id="apply" type="button">今回の評価に適用</button><button id="forget" type="button">登録解除</button></div></div>
-          <button id="resetPosition" type="button">表示位置を右上に戻す</button>
-          <div id="status" role="status" aria-live="polite">OFF。QBの評価は変更しない。</div>
-          <div id="foot">自動変更はQB画面上の反映を確認する。QBサーバーへの保存成功までは保証できないため、初回は再読み込みで確認する。</div>
+          <div id="fixedSettings" hidden>
+            <div id="learned"></div>
+            <details id="fixedTools"><summary>固定モードの設定</summary><div class="detailsContent"><div id="buttons"><button id="train" type="button">ボタン位置を登録</button><button id="apply" type="button">今回の評価に適用</button><button id="forget" type="button">登録解除</button></div></div></details>
+          </div>
+          <div id="status" role="status" aria-live="polite">待機中</div>
+          <details id="otherSettings"><summary>その他の設定</summary><div class="detailsContent"><button id="resetPosition" type="button">表示位置を右上に戻す</button><div id="foot">初回は評価を変更した後にQBを再読み込みし、保存を確認する。表示上の反映とサーバーへの保存は別である。</div></div></details>
         </div>
       </section>`;
     document.body.append(host);
@@ -795,7 +827,7 @@
       setInfo(config.mode === 'off'
         ? 'OFF。QB標準の自動評価に戻った。'
         : config.mode==='smart'?'自動判定を有効化。前回評価と正誤を確実に読める問題だけ変更。'
-        : `${LABELS[config.mode]}固定を有効化。${LABELS[config.mode]}のみの演習で使うこと。`, config.mode === 'off' ? 'neutral' : 'warn');
+        : `${LABELS[config.mode]}固定を有効化。${LABELS[config.mode]}のみの演習で使うこと。`, (config.mode === 'off' || config.mode === 'smart') ? 'neutral' : 'warn');
     });
     sh.getElementById('toggle').addEventListener('click', () => {
       config.collapsed = !config.collapsed;
