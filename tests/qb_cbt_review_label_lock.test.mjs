@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 
 const source=fs.readFileSync(new URL('../qb_cbt_review_label_lock.user.js', import.meta.url),'utf8');
-assert.match(source, /@version\s+0\.4\.0/);
+assert.match(source, /@version\s+0\.4\.5/);
 assert.match(source, /@updateURL\s+https:\/\/raw\.githubusercontent\.com\/Factbact\/cbt-anki-inbox\/main\/qb_cbt_review_label_lock\.user\.js/);
 assert.match(source, /id="unsure"/);
 assert.match(source, /id="undo"/);
@@ -21,6 +21,7 @@ function browser(initialHistory={},mode='smart'){
  const pendingTimeouts = [];
  const simulation={selected:'○'};
  let text=source.replace('  function selectedEvaluation() {','  function selectedEvaluation() { return globalThis.__sim.selected;');
+ text=text.replace('  function resolveCurrentCorrectness(q) {',"  function resolveCurrentCorrectness(q) { return {correct:true,source:'QBの結果表示'};");
  text=text.replace('  const findByLabel = (mode) => {','  const findByLabel = (mode) => { return {click(){globalThis.__sim.selected=mode;}, isConnected:true};');
  text=text.replace('  const selectedState = (el) => {','  const selectedState = (el) => { return false;');
  text=text.replace("  if (document.readyState === 'loading')", `  globalThis.__T={decideSmart,normalizeRecord,studyDay,getRecord,storeRecord,readSmartHistory,
