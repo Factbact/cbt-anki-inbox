@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.5
-// @description  前回評価・解答結果・SVG評価ボタンの取得を修正。自動押下と選択状態確認を復旧、登録ボタン対応。
+// @version      0.4.6
+// @description  評価ボタンの自動識別・一度だけの登録再利用・ドラッグによるパネルサイズ変更を改善。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -12,7 +12,7 @@
 // ==/UserScript==
 
 /*
- * QB CBT 復習ラベル管理 0.4.5
+ * QB CBT 復習ラベル管理 0.4.6
  *
  * ■ スマートモード（手動で有効化、初期値OFF）
  *   前回 ◎/○/△/× と今回の正解/不正解で評価を更新。
@@ -53,7 +53,7 @@
   Object.defineProperty(window, '__QB_CBT_REVIEW_LABEL_LOCK__', {value: true, configurable: false});
 
   const KEY = 'qbCbtReviewLock.v1';
-  const DEFAULTS = {mode: 'off', collapsed: false, position: null, learned: {triangle: null, wrong: null, correct: null, perfect: null}};
+  const DEFAULTS = {mode: 'off', collapsed: false, position: null, geometry: null, learned: {triangle: null, wrong: null, correct: null, perfect: null}};
   const LABELS = {triangle: '△', wrong: '×', correct:'○', perfect:'◎', smart: '自動', off: 'OFF'};
   const SMART_HISTORY_KEY = 'qbCbtReviewLock.smartHistory.v1';
   const LEGACY_BACKUP_KEY = 'qbCbtReviewLock.smartHistory.pre040.backup';
@@ -67,6 +67,8 @@
       return {
         mode: ['off','triangle','wrong','smart'].includes(loaded.mode) ? loaded.mode : 'off',
         collapsed: Boolean(loaded.collapsed),
+        geometry: loaded.geometry && Number.isFinite(loaded.geometry.width) && Number.isFinite(loaded.geometry.height)
+          ? {width:loaded.geometry.width,height:loaded.geometry.height} : null,
         position: loaded.position && Number.isFinite(loaded.position.left) && Number.isFinite(loaded.position.top)
           ? {left: loaded.position.left, top: loaded.position.top} : null,
         learned: {
@@ -141,6 +143,8 @@
       normalize(el.querySelector('img')?.getAttribute('alt')),
       normalize(el.querySelector('svg')?.getAttribute('aria-label')),
       normalize(el.querySelector('svg title')?.textContent),
+      normalize(el.getAttribute('data-rating')),
+      normalize(el.getAttribute('data-label')),
     ];
     for (const text of values) {
       if (['◎', '○', '〇', '△', '×', '✕'].includes(text)) return text === '〇' ? '○' : text === '✕' ? '×' : text;
@@ -218,46 +222,94 @@
     return true;
   };
 
+  // QBの自己評価欄は説明文の「自己評価：」の直後にアイコンボタンで表示される。
+  // 検索パネル側の「結果」フィルタや「解答履歴」とは区別して取得する。
+  // 曖昧な場合は「自動でクリックしない」を優先する。
+  function ratingSurface() {
+    const anchors=[...document.querySelectorAll('span,div,p,strong,b,label,h3,h4,h5,h6')]
+      .filter(el => isVisible(el) && !ui?.host.contains(el) &&
+        [...el.childNodes].filter(n=>n.nodeType===Node.TEXT_NODE).some(n=>/^自己評価\s*[:：]?$/.test(normalize(n.textContent))));
+    const surfaces=[];
+    for(const anchor of anchors) {
+      let root=anchor;
+      for(let depth=0; root && depth<6; root=root.parentElement,depth++) {
+        if(root===document.body || root.matches('main, #root, #__next'))break;
+        if(root.closest('[role="dialog"], [role="menu"]'))break;
+        const buttons=[...root.querySelectorAll('button,[role="button"]')].filter(validTarget);
+        // QBの自己評価欄にはアイコン式の4〜5個程度の操作が横並びにある。
+        if(buttons.length<4 || buttons.length>6)continue;
+        if(buttons.some(b=>/^(解答する|前の問題|次の問題|検索|登録)$/.test(exactText(b))))continue;
+        surfaces.push({root,buttons});
+        break;
+      }
+    }
+    if(surfaces.length!==1)return null;
+    return surfaces[0];
+  }
+
+  // 新しい問題でも「自己評価欄内の位置＋同じSVG構造」で登録を再利用する。
+  // 古いDOMパス方式も互換用に残すが、該当の自己評価欄以外には適用しない。
   const findLearned = (mode) => {
-    const rule = config.learned[mode];
-    if (!rule?.path) return null;
+    const rule=config.learned[mode];
+    if(!rule)return null;
+    const surface=ratingSurface();
+    if(surface && Number.isInteger(rule.index) && rule.index>=0 && rule.index<surface.buttons.length &&
+       (!rule.groupSize || rule.groupSize===surface.buttons.length)) {
+      const match=surface.buttons[rule.index];
+      if(validTarget(match) && (!rule.tag || rule.tag===match.tagName.toLowerCase()) &&
+          (!rule.shape || rule.shape===shapeOf(match)))return match;
+    }
+    if(!rule.path)return null;
     let match;
-    try { match = document.querySelector(rule.path); } catch (_) { return null; }
-    if (!validTarget(match)) return null;
-    if (rule.shape && shapeOf(match) !== rule.shape) return null;
-    if (rule.tag && match.tagName.toLowerCase() !== rule.tag) return null;
+    try{match=document.querySelector(rule.path);}catch(_){return null;}
+    if(!validTarget(match))return null;
+    if(surface && !surface.buttons.includes(match))return null;
+    if(rule.shape && shapeOf(match)!==rule.shape)return null;
+    if(rule.tag && match.tagName.toLowerCase()!==rule.tag)return null;
     return match;
   };
 
   const looksLikeEvaluationGroup = (button) => {
-    // 検索条件の「△」と解答後の自己評価ボタンを取り違えないため、
-    // ◎○△×のうち少なくとも3種類が近傍に表示されている場合だけ自動判定する。
-    let ancestor = button.parentElement;
-    for (let depth=0; ancestor && depth < 5; depth++, ancestor=ancestor.parentElement) {
-      const siblings = [...ancestor.querySelectorAll('button, [role="button"], label')]
-        .filter(validTarget)
-        .map(scoreSymbolOf)
-        .filter(Boolean);
-      if (new Set(siblings).size >= 3 && siblings.includes('△') && siblings.includes('×')) {
-        return true;
-      }
-      if (ancestor.matches('main, #root, #__next, body')) break;
+    const surface=ratingSurface();
+    if(surface)return surface.buttons.includes(button);
+    // 表示に自己評価ラベルがない構成では、識別できる評価アイコンが
+    // 少なくとも3種あるグループだけを認める（従来の模擬UIもここで対応）。
+    let ancestor=button.parentElement;
+    for(let depth=0;ancestor && depth<5;depth++,ancestor=ancestor.parentElement) {
+      const siblings=[...ancestor.querySelectorAll('button,[role="button"],label')]
+        .filter(validTarget).map(scoreSymbolOf).filter(Boolean);
+      if(new Set(siblings).size>=3 && siblings.includes('△') && siblings.includes('×'))return true;
+      if(ancestor.matches('main,#root,#__next,body'))break;
     }
     return false;
   };
+
   const findByLabel = (mode) => {
-    const expected = LABELS[mode] || mode;
+    const expected=LABELS[mode]||mode;
     const key=({'△':'triangle','×':'wrong','○':'correct','◎':'perfect'})[expected];
-    // 旧版で成功していた「登録済みのボタンをクリック」を最優先。
-    // 登録したSVGやDOM位置が変わった時は安全に停止する。
+    // 文字・SVGなどで識別できればユーザーのボタン登録なしで使う。
+    const surface=ratingSurface();
+    const candidates=surface?surface.buttons:[...document.querySelectorAll('button,[role="button"],label')]
+      .filter(b=>validTarget(b) && looksLikeEvaluationGroup(b));
+    const matches=candidates.filter(b=>labelOf(b)===expected);
+    if(matches.length===1)return matches[0];
+    if(matches.length>1)return null;
+    // 未知のSVGは一度登録すれば、次の問題以降も自己評価欄の位置で照合する。
     if(key && config.learned[key]) {
       const trained=findLearned(key);
       if(trained && (!scoreSymbolOf(trained)||scoreSymbolOf(trained)===expected))return trained;
     }
-    const matches = [...document.querySelectorAll('button, [role="button"], label')]
-      .filter(b => validTarget(b) && labelOf(b) === expected && looksLikeEvaluationGroup(b));
-    return matches.length===1 ? matches[0] : null;
+    return null;
   };
+
+  function rememberButton(mode, target) {
+    const surface=ratingSurface();
+    const index=surface?.buttons.indexOf(target) ?? -1;
+    config.learned[mode]={
+      path:domPath(target),shape:shapeOf(target),tag:target.tagName.toLowerCase(),
+      index:index>=0?index:null,groupSize:index>=0?surface.buttons.length:null,
+    };
+  }
 
   const selectedState = (el) => {
     if (el.getAttribute('aria-pressed') === 'true' || el.getAttribute('aria-checked') === 'true') return true;
@@ -420,6 +472,24 @@
     return groups.filter(g => !groups.some(h=>h!==g && g.node.contains(h.node)));
   }
   function selectedFromGroup() {
+    const surface=ratingSurface();
+    if(surface) {
+      const chosen=surface.buttons.filter(b=>selectedState(b)===true);
+      if(chosen.length===1) {
+        const explicit=scoreSymbolOf(chosen[0]);
+        if(explicit)return explicit;
+        // 未知アイコンでも、本人が以前登録した相対位置なら復元可能。
+        const index=surface.buttons.indexOf(chosen[0]);
+        const keyBySymbol={'△':'triangle','×':'wrong','○':'correct','◎':'perfect'};
+        const mapped=Object.keys(keyBySymbol).filter(symbol=>{
+          const rule=config.learned[keyBySymbol[symbol]];
+          return rule && rule.index===index && rule.groupSize===surface.buttons.length &&
+            (!rule.shape || rule.shape===shapeOf(chosen[0]));
+        });
+        if(mapped.length===1)return mapped[0];
+      }
+      return null;
+    }
     const groups=evaluationGroups();
     if(groups.length!==1)return null;
     const chosen=groups[0].buttons.filter(b=>selectedState(b)===true);
@@ -874,7 +944,7 @@
     }
     const button=findByLabel(result.label);
     if(!button) {
-      setReason(`前回${task.before.label}・今回${correct?'正解':'不正解'}を取得。${result.label}のボタンをQB画面で特定できない。下部の「評価ボタン登録」で一度だけ登録すると次回から自動クリックする。`);
+      setReason(`前回${task.before.label}・今回${correct?'正解':'不正解'}を取得。${result.label}のボタンをQB画面で特定できない。未登録のアイコン形式の場合のみ一度登録すると、同じ画面形式の別問題にも引き継ぐ。`);
       setInfo(`判定成功・クリック不可：${result.label}のボタンが未認識。設定からボタンを登録。`,'warn');
       return true;
     }
@@ -1017,6 +1087,68 @@
     sh.getElementById('modeName').dataset.mode = config.mode;
   }
 
+  const MIN_PANEL_WIDTH=250, MIN_PANEL_HEIGHT=155, PANEL_MARGIN=8;
+  function clampPanelGeometry(width,height) {
+    return {
+      width:Math.max(Math.min(MIN_PANEL_WIDTH,window.innerWidth-16),Math.min(Math.round(width),window.innerWidth-16)),
+      height:Math.max(Math.min(MIN_PANEL_HEIGHT,window.innerHeight-16),Math.min(Math.round(height),window.innerHeight-16))
+    };
+  }
+  function applyPanelGeometry() {
+    if(!ui)return;
+    const panel=ui.shadow.getElementById('panel');
+    if(!panel)return;
+    if(config.geometry) {
+      const size=clampPanelGeometry(config.geometry.width,config.geometry.height);
+      panel.style.width=`${size.width}px`;
+      panel.style.height=config.collapsed?'':`${size.height}px`;
+    } else {
+      panel.style.width='';panel.style.height='';
+    }
+  }
+  function installResize() {
+    const panel=ui.shadow.getElementById('panel');
+    let sizing=null;
+    for(const handle of ui.shadow.querySelectorAll('[data-resize]')) {
+      handle.addEventListener('pointerdown',event=>{
+        if(event.button!==0 || config.collapsed)return;
+        event.preventDefault();event.stopPropagation();
+        const rect=panel.getBoundingClientRect();
+        sizing={id:event.pointerId,dir:handle.dataset.resize,handle,
+          sx:event.clientX,sy:event.clientY,x:rect.left,y:rect.top,w:rect.width,h:rect.height};
+        try{handle.setPointerCapture(event.pointerId);}catch(_){}
+        window.addEventListener('pointermove',onResize,true);
+        window.addEventListener('pointerup',stopResize,true);
+        window.addEventListener('pointercancel',stopResize,true);
+      });
+    }
+    function onResize(event) {
+      if(!sizing || event.pointerId!==sizing.id)return;
+      event.preventDefault();
+      const {dir,sx,sy,x,y,w,h}=sizing,dx=event.clientX-sx,dy=event.clientY-sy;
+      const size=clampPanelGeometry(w+(dir.includes('e')?dx:dir.includes('w')?-dx:0),
+                                   h+(dir.includes('s')?dy:dir.includes('n')?-dy:0));
+      const left=x+(dir.includes('w')?(w-size.width):0);
+      const top=y+(dir.includes('n')?(h-size.height):0);
+      panel.style.width=`${size.width}px`;
+      panel.style.height=`${size.height}px`;
+      // 右上固定の初期位置でも左右上下から拡大できるようにする。
+      positionPanel({left,top});
+    }
+    function stopResize(event) {
+      if(!sizing || event.pointerId!==sizing.id)return;
+      try{sizing.handle.releasePointerCapture(sizing.id);}catch(_){}
+      window.removeEventListener('pointermove',onResize,true);
+      window.removeEventListener('pointerup',stopResize,true);
+      window.removeEventListener('pointercancel',stopResize,true);
+      const rect=panel.getBoundingClientRect();
+      config.geometry={width:Math.round(rect.width),height:Math.round(rect.height)};
+      const hostRect=ui.host.getBoundingClientRect();
+      config.position={left:Math.round(hostRect.left),top:Math.round(hostRect.top)};
+      save();sizing=null;
+    }
+  }
+
   // 右上を初期位置にし、移動した位置は画面内へ補正して復元する。
   function positionPanel(position) {
     if (!ui) return;
@@ -1047,20 +1179,20 @@
         :host {all:initial;color-scheme:light;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif}
         * {box-sizing:border-box}
         [hidden] {display:none!important}
-        #panel {width:304px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 8px 26px rgba(15,23,42,.16);overflow:hidden}
-        #top {display:flex;align-items:center;gap:8px;padding:10px 12px;background:#f8fafc;border-bottom:1px solid #e2e8f0;cursor:grab;touch-action:none;user-select:none}
+        #panel {position:relative;display:flex;flex-direction:column;width:304px;min-width:250px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 8px 26px rgba(15,23,42,.16);overflow:visible}
+        #top {display:flex;align-items:center;gap:8px;padding:10px 12px;background:#111827;border-bottom:1px solid #1e40af;border-radius:11px 11px 0 0;color:#fff;cursor:grab;touch-action:none;user-select:none}
         #top:active {cursor:grabbing}
-        #title {flex:1;font-weight:750;font-size:13px;letter-spacing:.01em;color:#0f172a}
-        #modeName {padding:3px 7px;border-radius:6px;background:#e2e8f0;color:#334155;font-weight:700;font-size:11px;white-space:nowrap}
-        #modeName[data-mode="smart"] {background:#dbeafe;color:#1e40af}
+        #title {flex:1;font-weight:750;font-size:13px;letter-spacing:.01em;color:#fff}
+        #modeName {padding:3px 7px;border-radius:6px;background:#334155;color:#fff;font-weight:700;font-size:11px;white-space:nowrap}
+        #modeName[data-mode="smart"] {background:#bfdbfe;color:#1e3a8a}
         #modeName[data-mode="triangle"],#modeName[data-mode="wrong"] {background:#eef2ff;color:#3730a3}
         button,select {font:inherit}
         button {border:1px solid #cbd5e1;background:#fff;color:#1e293b;border-radius:8px;cursor:pointer;padding:7px 10px;font-weight:600;transition:background .12s,border-color .12s}
         button:hover:not(:disabled) {background:#f1f5f9;border-color:#94a3b8}
         button:focus-visible,select:focus-visible,summary:focus-visible {outline:2px solid #2563eb;outline-offset:2px}
         button:disabled {opacity:.45;cursor:not-allowed}
-        #toggle {font-size:11px;padding:3px 7px;font-weight:600}
-        #main {padding:12px;max-height:calc(100vh - 82px);overflow:auto}
+        #toggle {font-size:11px;padding:3px 7px;font-weight:600;background:#334155;color:#fff;border-color:#64748b}
+        #main {flex:1;min-height:0;padding:12px;max-height:calc(100vh - 82px);overflow:auto;border-radius:0 0 12px 12px}
         label {display:block;font-size:12px;font-weight:700;color:#334155;margin:0 0 5px}
         select {width:100%;height:36px;padding:5px 9px;border:1px solid #94a3b8;border-radius:8px;color:#0f172a;background:#fff}
         #hint {font-size:11px;color:#854d0e;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:7px 9px;margin-top:10px}
@@ -1101,8 +1233,26 @@
         #buttons button {font-size:11px;flex:1}
         #resetPosition {width:100%;font-size:11px;margin-top:8px}
         #foot {font-size:11px;color:#475569;line-height:1.5;margin-top:8px}
+        .resize-handle {position:absolute;z-index:5;touch-action:none;pointer-events:auto;background:transparent}
+        .resize-handle:hover {background:rgba(37,99,235,.13)}
+        .resize-n {top:-6px;left:15px;right:15px;height:12px;cursor:ns-resize}
+        .resize-s {bottom:-6px;left:15px;right:15px;height:12px;cursor:ns-resize}
+        .resize-e {right:-6px;top:15px;bottom:15px;width:12px;cursor:ew-resize}
+        .resize-w {left:-6px;top:15px;bottom:15px;width:12px;cursor:ew-resize}
+        .resize-ne {top:-7px;right:-7px;width:17px;height:17px;cursor:nesw-resize}
+        .resize-nw {top:-7px;left:-7px;width:17px;height:17px;cursor:nwse-resize}
+        .resize-se {bottom:-7px;right:-7px;width:17px;height:17px;cursor:nwse-resize;background:rgba(37,99,235,.12);border-radius:0 0 6px 0}
+        .resize-sw {bottom:-7px;left:-7px;width:17px;height:17px;cursor:nesw-resize}
       </style>
       <section id="panel" aria-label="QB CBT 復習ラベル管理">
+        <span class="resize-handle resize-n" data-resize="n" aria-hidden="true"></span>
+        <span class="resize-handle resize-s" data-resize="s" aria-hidden="true"></span>
+        <span class="resize-handle resize-e" data-resize="e" aria-hidden="true"></span>
+        <span class="resize-handle resize-w" data-resize="w" aria-hidden="true"></span>
+        <span class="resize-handle resize-ne" data-resize="ne" aria-hidden="true"></span>
+        <span class="resize-handle resize-nw" data-resize="nw" aria-hidden="true"></span>
+        <span class="resize-handle resize-se" data-resize="se" aria-hidden="true"></span>
+        <span class="resize-handle resize-sw" data-resize="sw" aria-hidden="true"></span>
         <div id="top" title="ドラッグして移動"><span id="title">QB 復習アシスト</span><span id="modeName">OFF</span><button id="toggle" type="button" aria-expanded="true">閉じる</button></div>
         <div id="main">
           <label for="mode">動作モード</label>
@@ -1127,14 +1277,16 @@
             <details id="fixedTools"><summary>固定モードの設定</summary><div class="detailsContent"><div id="buttons"><button id="train" type="button">ボタン位置を登録</button><button id="apply" type="button">今回の評価に適用</button><button id="forget" type="button">登録解除</button></div></div></details>
           </div>
           <div id="status" role="status" aria-live="polite">待機中</div>
-          <details id="otherSettings"><summary>その他の設定</summary><div class="detailsContent"><div class="small">自動判定で評価ボタンが認識されない場合は、その記号を選んで一度だけQBの本来のボタンを押して登録する。</div>
+          <details id="otherSettings"><summary>その他の設定</summary><div class="detailsContent"><div class="small">通常は自動認識する。未知のアイコンだけ、最初の1回登録すれば他の問題にも適用する。</div>
             <div class="compact"><select id="calibrateLabel" aria-label="登録する評価"><option value="△">△ボタン</option><option value="×">×ボタン</option><option value="○">○ボタン</option><option value="◎">◎ボタン</option></select><button id="calibrate" type="button">評価ボタンを登録</button></div>
-            <button id="resetPosition" type="button">表示位置を右上に戻す</button><div id="foot">初回は評価を変更した後にQBを再読み込みし、保存を確認する。表示上の反映とサーバーへの保存は別である。</div></div></details>
+            <button id="resetPosition" type="button">表示位置を右上に戻す</button><p class="small">パネルの四隅や辺をドラッグすると、大きさを変更して保存できる。</p><div id="foot">初回は評価を変更した後にQBを再読み込みし、保存を確認する。表示上の反映とサーバーへの保存は別である。</div></div></details>
         </div>
       </section>`;
     document.body.append(host);
     ui = {host, shadow: sh};
+    applyPanelGeometry();
     positionPanel(config.position);
+    installResize();
 
     // ヘッダーのみドラッグ可。畳むボタンはクリック操作を優先する。
     const bar = sh.getElementById('top');
@@ -1200,7 +1352,7 @@
     });
     sh.getElementById('toggle').addEventListener('click', () => {
       config.collapsed = !config.collapsed;
-      save(); refreshUI();
+      save(); refreshUI();applyPanelGeometry();
       // 展開後に画面外へ出てしまう場合は表示位置を補正する。
       if (config.position) positionPanel(config.position);
     });
@@ -1248,7 +1400,7 @@
   function apply(task) {
     if (learning || config.mode !== task.mode || task.q !== questionId() || task.done) return false;
     if (!hasResultUI()) return false;
-    const el = config.learned[task.mode] ? findLearned(task.mode) : findByLabel(task.mode);
+    const el = findByLabel(task.mode);
     if (!el) return false;
     task.done = true; // 処理前にセットし、連打やobserverの再入を防ぐ。
     if (selectedState(el) === true) {
@@ -1305,9 +1457,7 @@
         setInfo(`${targetSymbol}以外のボタンを検出。登録は続行する。`, 'warn');
         return;
       }
-      config.learned[key] = {
-        path: domPath(target),shape: shapeOf(target),tag:target.tagName.toLowerCase(),
-      };
+      rememberButton(key,target);
       learning=false;learningTarget=null;
       pending=null;
       save();refreshUI();
@@ -1373,6 +1523,7 @@
       setInfo('別のタブで履歴が更新されたため、待機中の自動操作を停止した。','warn');
     });
     window.addEventListener('resize', () => {
+      applyPanelGeometry();
       if (config.position) positionPanel(config.position);
     });
     window.setInterval(() => {
