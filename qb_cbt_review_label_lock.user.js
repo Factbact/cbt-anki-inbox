@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.1
-// @description  すっきりした操作パネルで、QB CBTの評価を自動判定。異なる学習日で3回の連続正解・自信なし・取り消し対応。
+// @version      0.4.5
+// @description  前回評価・解答結果・SVG評価ボタンの取得を修正。自動押下と選択状態確認を復旧、登録ボタン対応。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -12,7 +12,7 @@
 // ==/UserScript==
 
 /*
- * QB CBT 復習ラベル管理 0.4.1
+ * QB CBT 復習ラベル管理 0.4.5
  *
  * ■ スマートモード（手動で有効化、初期値OFF）
  *   前回 ◎/○/△/× と今回の正解/不正解で評価を更新。
@@ -53,8 +53,8 @@
   Object.defineProperty(window, '__QB_CBT_REVIEW_LABEL_LOCK__', {value: true, configurable: false});
 
   const KEY = 'qbCbtReviewLock.v1';
-  const DEFAULTS = {mode: 'off', collapsed: false, position: null, learned: {triangle: null, wrong: null}};
-  const LABELS = {triangle: '△', wrong: '×', smart: '自動', off: 'OFF'};
+  const DEFAULTS = {mode: 'off', collapsed: false, position: null, learned: {triangle: null, wrong: null, correct: null, perfect: null}};
+  const LABELS = {triangle: '△', wrong: '×', correct:'○', perfect:'◎', smart: '自動', off: 'OFF'};
   const SMART_HISTORY_KEY = 'qbCbtReviewLock.smartHistory.v1';
   const LEGACY_BACKUP_KEY = 'qbCbtReviewLock.smartHistory.pre040.backup';
   const LABEL_SET = ['◎','○','△','×','未演習'];
@@ -72,6 +72,8 @@
         learned: {
           triangle: loaded.learned?.triangle || null,
           wrong: loaded.learned?.wrong || null,
+          correct: loaded.learned?.correct || null,
+          perfect: loaded.learned?.perfect || null,
         },
       };
     } catch (_) {return structuredClone(DEFAULTS);}
@@ -84,6 +86,7 @@
 
   let pending = null;
   let learning = false;
+  let learningTarget = null;
   let lastUrl = location.href;
   let scanTimer = null;
   let ui = null;
@@ -91,6 +94,13 @@
   let lastAutomatic = null; // 同じ問題で行った直前の自動評価のみ復元できる。
   let answerContext = null; // 今回の解答が正解かどうかの確定情報。
   let lastDecision = null;
+  // QBがアイコン(SVG)だけで評価を表示している場合にも、既存の解答履歴を照会する。
+  // GETは同一オリジンの読み取り専用。QBの成績を変更するAPIは呼ばない。
+  const previousSnapshots = new Map();
+  const answerSnapshots = new Map();
+  const answerKeys = new Map();
+  const postAnswerDom = new Map();
+  const MAX_SNAPSHOT_CACHE = 60;
 
   const normalize = (value) => String(value || '')
     .replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
@@ -135,6 +145,25 @@
     for (const text of values) {
       if (['◎', '○', '〇', '△', '×', '✕'].includes(text)) return text === '〇' ? '○' : text === '✕' ? '×' : text;
       if (/^([◎○〇△×✕])\s*(?:自信なし|自己評価|評価|正解|不正解|間違い|カンペキ(?:、もう見ない)?|完璧(?:、もう見ない)?|カンペキ、もう見ない)$/.test(text)) return text[0] === '〇' ? '○' : text[0] === '✕' ? '×' : text[0];
+    }
+    // UIで文字を持たないアイコンの判定。既知のSVG形状だけを認め、推測しない。
+    for (const svg of el.querySelectorAll('svg')) {
+      const paths=[...svg.querySelectorAll('path[d]')].map(p=>(p.getAttribute('d')||'').replace(/\s+/g,''));
+      if(paths.some(d=>d.includes('M127.77L18.3918H5.61L127.77') && d.includes('M124L220h20L124z')))return '△';
+      const lines=[...svg.querySelectorAll('line[x1][x2][y1][y2]')];
+      if(lines.length===2) {
+        const isCross=line=>Number(line.getAttribute('x1'))+Number(line.getAttribute('x2'))===24 &&
+          Number(line.getAttribute('y1'))+Number(line.getAttribute('y2'))===24;
+        if(lines.every(isCross)&&lines[0].getAttribute('x1')!==lines[1].getAttribute('x1'))return '×';
+      }
+      if(paths.some(d=>/M18[ ,]?6L?6[ ,]?18/i.test(d)) && paths.some(d=>/M6[ ,]?6l?12[ ,]?12/i.test(d)))return '×';
+      // 内外2つの円が明示されていれば二重丸、円1つなら丸（他のSVG図形を含まないときだけ）。
+      const circles=[...svg.querySelectorAll('circle[cx][cy][r]')];
+      const shapes=svg.querySelectorAll('path,rect,polygon,polyline,line');
+      if(shapes.length===0 && circles.length===2 &&
+        circles.every(c=>c.getAttribute('cx')===circles[0].getAttribute('cx') && c.getAttribute('cy')===circles[0].getAttribute('cy')) &&
+        circles[0].getAttribute('r')!==circles[1].getAttribute('r'))return '◎';
+      if(shapes.length===0 && circles.length===1)return '○';
     }
     return null;
   };
@@ -218,10 +247,16 @@
   };
   const findByLabel = (mode) => {
     const expected = LABELS[mode] || mode;
+    const key=({'△':'triangle','×':'wrong','○':'correct','◎':'perfect'})[expected];
+    // 旧版で成功していた「登録済みのボタンをクリック」を最優先。
+    // 登録したSVGやDOM位置が変わった時は安全に停止する。
+    if(key && config.learned[key]) {
+      const trained=findLearned(key);
+      if(trained && (!scoreSymbolOf(trained)||scoreSymbolOf(trained)===expected))return trained;
+    }
     const matches = [...document.querySelectorAll('button, [role="button"], label')]
       .filter(b => validTarget(b) && labelOf(b) === expected && looksLikeEvaluationGroup(b));
-    // 曖昧な場合は誤タップ防止のため中断する（その場合はボタン位置を登録）。
-    return matches.length === 1 ? matches[0] : null;
+    return matches.length===1 ? matches[0] : null;
   };
 
   const selectedState = (el) => {
@@ -233,6 +268,10 @@
     if (el.getAttribute('data-state') === 'unchecked') return false;
     if (el.matches('input[type="radio"], input[type="checkbox"]')) return el.checked;
     if (el.querySelector('input[type="radio"]:checked,input[type="checkbox"]:checked')) return true;
+    // QBの評価ボタンが選択をclassで表す場合の検出。hover/focus色は判定に使わない。
+    if(el.classList?.contains('selected') || el.classList?.contains('is-selected') ||
+       el.classList?.contains('is-active')) return true;
+    if(el.getAttribute('data-state')==='active')return true;
     return null; // 判断不可：アイコン色などから推測しない。
   };
 
@@ -380,13 +419,304 @@
     // 大きな祖先で重複した「見かけだけのグループ」を除去。
     return groups.filter(g => !groups.some(h=>h!==g && g.node.contains(h.node)));
   }
-  function selectedEvaluation() {
+  function selectedFromGroup() {
     const groups=evaluationGroups();
     if(groups.length!==1)return null;
     const chosen=groups[0].buttons.filter(b=>selectedState(b)===true);
     if(chosen.length!==1)return null;
     return scoreSymbolOf(chosen[0]);
   }
+  function selectedEvaluation() {
+    const explicit=selectedFromGroup();
+    if(explicit)return explicit;
+    const q=questionId();
+    if(!validQuestionUuid(q)||!hasResultUI())return null;
+    const live=reactHistorySnapshot(q);
+    return ratingFromSnapshot(live,q)?.label||null;
+  }
+  // ===== v0.4.2: QB解答履歴の読み取り =====
+  const statusMap=Object.freeze({1:'△',2:'○',3:'◎'});
+  const validQuestionUuid=q=>typeof q==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(q);
+  const isAttemptData=v=>v&&typeof v==='object'&&['user_status','answer_status','users_answer','answered_date','answer_histories'].some(k=>Object.prototype.hasOwnProperty.call(v,k));
+  function userAnswers(raw) {
+    if(raw===undefined||raw===null)return [];
+    if(Array.isArray(raw))return raw.flatMap(userAnswers);
+    if(typeof raw==='object')return [];
+    const t=String(raw).toLowerCase();
+    // 問題の正答は選択肢記号 a～z（単問・多選択肢に対応）。
+    const m=t.match(/\b[a-z]\b/g);
+    if(m)return [...new Set(m)].sort();
+    if(/^[a-z]+$/.test(t))return [...new Set(t.split(''))].sort();
+    return [];
+  }
+  function answerCorrectness(attempt,correctAnswers) {
+    if(!attempt||!Array.isArray(correctAnswers)||!correctAnswers.length)return null;
+    const users=userAnswers(attempt.users_answer);
+    if(!users.length)return null;
+    const choices=correctAnswers.map(userAnswers).filter(a=>a.length);
+    if(!choices.length)return null;
+    return choices.some(a=>a.length===users.length && a.every((letter,i)=>letter===users[i]));
+  }
+  function ratingFromAttempt(attempt,correctAnswers) {
+    if(!attempt||typeof attempt!=='object')return null;
+    const n=Number(attempt.user_status);
+    if(attempt.user_status!==null && attempt.user_status!==undefined && statusMap[n])return statusMap[n];
+    if(answerCorrectness(attempt,correctAnswers)===false)return '×';
+    return null;
+  }
+  function ratingFromSnapshot(item,q) {
+    if(!item)return null;
+    const a=item.attempt||item.data;
+    const label=ratingFromAttempt(a,item.correctAnswers||answerKeys.get(q));
+    if(label)return {label,source:item.source};
+    // 無回答はQBの明示的な回答履歴（空配列）と無回答情報の両方が揃ったときのみ。
+    if(a&&Array.isArray(a.answer_histories)&&a.answer_histories.length===0 &&
+       (a.users_answer===null||a.users_answer===undefined) &&
+       (a.user_status===null||a.user_status===undefined) &&
+       (a.answered_date===null||a.answered_date===undefined))
+      return {label:'未演習',source:item.source};
+    return null;
+  }
+  function copyAttempt(raw,depth=0) {
+    // React objects can mutate in place: snapshot must be a COPY from before answering.
+    if(!raw||typeof raw!=='object')return null;
+    return {
+      question_data_id:raw.question_data_id??null,question_id:raw.question_id??null,
+      users_answer:cloneData(raw.users_answer??null),
+      user_status:raw.user_status??null,answer_status:raw.answer_status??null,
+      answered_date:cloneData(raw.answered_date??null),
+      updated_date:cloneData(raw.updated_date??null),
+      answer_histories:depth===0 && Array.isArray(raw.answer_histories)
+        ? raw.answer_histories.slice(0,5).map(a=>copyAttempt(a,1)).filter(Boolean):null
+    };
+  }
+  function safeHistoryItem(raw,q,source,correctAnswers) {
+    if(!raw||typeof raw!=='object')return null;
+    const candidate=raw.question_data_id===q||raw.question_id===q;
+    if(!candidate||!isAttemptData(raw))return null;
+    return {attempt:copyAttempt(raw),correctAnswers,source};
+  }
+  function findMatchingHistory(root,q,source,correctAnswers) {
+    if(!root||typeof root!=='object'||!validQuestionUuid(q))return null;
+    const queue=[{value:root,depth:0}],seen=new WeakSet();
+    let offset=0,chosen=null,score=-1;
+    while(offset<queue.length&&offset<18000) {
+      const {value:v,depth}=queue[offset++];
+      if(!v||typeof v!=='object'||seen.has(v))continue;
+      seen.add(v);
+      const item=safeHistoryItem(v,q,source,correctAnswers);
+      if(item){
+        const next=(v.user_status!==undefined&&v.user_status!==null?10:0)+
+          (v.users_answer!==undefined&&v.users_answer!==null?5:0)+
+          (Array.isArray(v.answer_histories)?3:0)+(v.answered_date?2:0);
+        if(next>score){chosen=item;score=next;}
+      }
+      if(depth>=14||v.nodeType||v.ownerDocument)continue;
+      let entries=[];
+      try{entries=Object.entries(v);}catch(_){continue;}
+      for(const [name,child] of entries) {
+        if(name==='stateNode'||name==='ownerDocument'||name==='document'||name==='window')continue;
+        if(!child||typeof child!=='object'||child.nodeType||child.ownerDocument)continue;
+        queue.push({value:child,depth:depth+1});
+        if(queue.length>=20000)break;
+      }
+    }
+    return chosen;
+  }
+  function reactHistorySnapshot(q) {
+    if(!validQuestionUuid(q))return null;
+    const elements=[document.documentElement,document.body,
+      ...document.querySelectorAll('main,#__next,#root,form,section,div')];
+    let count=0;
+    const roots=new Set();
+    for(const el of elements) {
+      if(!el||count>=8)break;
+      for(const key of Object.keys(el)) {
+        if(!/^__react(?:Fiber|Props|Container)\$/.test(key))continue;
+        const value=el[key];
+        if(!value||typeof value!=='object'||roots.has(value))continue;
+        roots.add(value);count++;
+        // React側の履歴はQBの問題UUIDと一致するものだけを採用。
+        const item=findMatchingHistory(value,q,'QBのReact解答履歴',null);
+        if(item)return item;
+        if(count>=8)break;
+      }
+    }
+    return null;
+  }
+  async function getQuestionSnapshot(q) {
+    if(!validQuestionUuid(q))return null;
+    const controller=new AbortController();
+    const timer=window.setTimeout(()=>controller.abort(),5000);
+    try{
+      const response=await window.fetch(`/api/questions/${encodeURIComponent(q)}`,{
+        method:'GET',credentials:'same-origin',cache:'no-store',
+        headers:{Accept:'application/json'},signal:controller.signal
+      });
+      if(!response.ok)return null;
+      const data=await response.json();
+      const correctAnswers=Array.isArray(data?.correct_answers)?data.correct_answers:null;
+      if(correctAnswers)answerKeys.set(q,correctAnswers);
+      return findMatchingHistory(data,q,'QBの同一サイト解答履歴',correctAnswers);
+    }catch(_){return null;}
+    finally{window.clearTimeout(timer);}
+  }
+  function attemptFingerprint(item) {
+    const a=item?.attempt;
+    if(!a)return '';
+    // Stability in React through submit: identical answer choice can still be a NEW attempt.
+    const date=a.answered_date||a.updated_date;
+    const stamp=date&&typeof date==='object'?`${date.seconds||''}.${date.nanoseconds||''}`:String(date||'');
+    const values=[stamp,JSON.stringify(a.users_answer??null),
+      String(a.user_status??''),String(a.answer_status??''),
+      String(Array.isArray(a.answer_histories)?a.answer_histories.length:'')];
+    return values.join('|');
+  }
+  function startPreviousLookup(q) {
+    if(!validQuestionUuid(q)||previousSnapshots.has(q)||hasResultUI())return;
+    if(previousSnapshots.size>=MAX_SNAPSHOT_CACHE)previousSnapshots.delete(previousSnapshots.keys().next().value);
+    const react=reactHistorySnapshot(q);
+    const entry={snapshot:react,baseline:attemptFingerprint(react),domBaseline:latestDOMFingerprint(),api:null,done:false,submissionStarted:false};
+    previousSnapshots.set(q,entry);
+    entry.promise=getQuestionSnapshot(q).then(item=>{
+      // 非同期読み取りが解答後に終了した場合、今回の評価を「前回の評価」と誤認しない。
+      if(!entry.submissionStarted)entry.api=item;
+      entry.done=true;
+      if(q===questionId()&&config.mode==='smart')refreshSmartInfo();
+    });
+  }
+  function previouslyObservedLabel(q) {
+    const entry=previousSnapshots.get(q);
+    return ratingFromSnapshot(entry?.api,q)||ratingFromSnapshot(entry?.snapshot,q);
+  }
+  function resultFromQBText() {
+    if(!hasResultUI())return null;
+    const found=new Set();
+    // QB実画面（2026-10-25）では「結果：」と「正解：b」は別要素。
+    // 解答後だけ、画面上の短い結果表示を読む。解説本文・検索結果・解答履歴の「正解」は使わない。
+    for(const el of document.querySelectorAll('span,strong,p,div,h3,h4')) {
+      if(!isVisible(el)||ui?.host.contains(el))continue;
+      if(el.closest('[role="dialog"],[role="menu"]'))continue;
+      const t=normalize(el.textContent);
+      if(t.length>90)continue;
+      let m=t.match(/^(?:今回の)?結果\s*[:：]?\s*(不正解|正解)(?:です|でした)?[。！!]?$/);
+      if(!m && t.length<=45 && /(?:^|[：:])(?:不正解|正解)/.test(t))
+        m=t.match(/^(不正解|正解)\s*[:：]\s*(?:[a-z](?:[,、・/\s]*[a-z])*)?$/i);
+      if(m)found.add(m[1]==='正解');
+    }
+    return found.size===1?[...found][0]:null;
+  }
+  // QB実画面の「解答履歴」表を読み取り、最新行と以前の行を厳密に区別する。
+  function qbVisibleHistoryRows() {
+    const matches=[];
+    for(const table of document.querySelectorAll('table')) {
+      if(!isVisible(table)||ui?.host.contains(table))continue;
+      const th=[...table.querySelectorAll('th')].map(x=>normalize(x.textContent));
+      if(!th.some(x=>x.includes('解答履歴'))||!th.some(x=>x.includes('選択した解答')))continue;
+      const entries=[];
+      for(const tr of table.querySelectorAll('tr')) {
+        const cells=[...tr.querySelectorAll('td')];
+        if(cells.length<3)continue;
+        const text=cells.map(x=>normalize(x.textContent));
+        if(!/^20\d{2}\/\d{1,2}\/\d{1,2}$/.test(text[0]))continue;
+        const correct=text.find(x=>x==='正解'||x==='不正解');
+        if(!correct)continue;
+        const ratingCell=cells[cells.length-1];
+        // 評価はSVGのことがある。正誤列と評価列は区別する。
+        const symbol=scoreSymbolOf(ratingCell);
+        entries.push({day:text[0],correct:correct==='正解',label:symbol|| (correct==='不正解'?'×':null),text:text.join('|')});
+      }
+      if(entries.length)matches.push(entries);
+    }
+    return matches.length===1?matches[0]:[];
+  }
+  function resultFromHistory(item,q) {
+    if(!item)return null;
+    const verdict=answerCorrectness(item.attempt,item.correctAnswers||answerKeys.get(q));
+    return typeof verdict==='boolean'?verdict:null;
+  }
+  function latestDOMFingerprint() {
+    const qb=qbVisibleHistoryRows();
+    if(qb.length)return qb.slice(0,6).map(x=>x.text).join('||');
+    const rows=[];
+    for(const el of document.querySelectorAll('tr,[role="row"],li')) {
+      if(!isVisible(el)||ui?.host.contains(el))continue;
+      const t=normalize(el.textContent);
+      if(t.length<=260 && /20\d{2}\/\d{1,2}\/\d{1,2}/.test(t) && /(?:不正解|正解)/.test(t))rows.push(t);
+    }
+    return rows.slice(0,6).join('||');
+  }
+  function resultFromLatestDOM() {
+    if(!hasResultUI())return null;
+    const historyRows=qbVisibleHistoryRows();
+    if(historyRows.length)return historyRows[0].correct;
+    // QBの解答履歴にある「YYYY/MM/DD ... 正解/不正解」だけを対象にする。
+    // 学習内容・問題文・検索パネル中の「正解」という語は判定に使わない。
+    const rows=[];
+    for(const el of document.querySelectorAll('tr,[role="row"],li')) {
+      if(!isVisible(el)||ui?.host.contains(el))continue;
+      const t=normalize(el.textContent);
+      if(t.length>260||!/(?:^|\s)20\d{2}\/\d{1,2}\/\d{1,2}/.test(t))continue;
+      const n=/(?:^|\s)不正解(?:\s|$)/.test(t);
+      const y=/(?:^|\s)正解(?:\s|$)/.test(t);
+      if(n===y)continue;
+      rows.push({day:(t.match(/20\d{2}\/\d{1,2}\/\d{1,2}/)||[])[0],result:!n});
+    }
+    if(!rows.length)return null;
+    rows.sort((a,b)=>b.day.localeCompare(a.day));
+    return rows[0].result;
+  }
+  // 解答後の評価○/×がSVGだけで読めなくても「結果：正解/不正解」を優先する。
+  function resolveCurrentCorrectness(q) {
+    const fromText=resultFromQBText();
+    if(fromText!==null)return {correct:fromText,source:'QBの結果表示'};
+    // Reactの前回回答を「今回の回答」と誤認しないため、解答ボタンの押下以降の
+    // answer UI変化が確認されてからのみ最新データを評価する。
+    const before=previousSnapshots.get(q)?.baseline;
+    const live=reactHistorySnapshot(q);
+    // 回答後のReact状態に確実に変化が起きた時だけ、今回の解答とみなす。
+    const changed=before && attemptFingerprint(live) && attemptFingerprint(live)!==before;
+    const fromReact=changed?resultFromHistory(live,q):null;
+    if(fromReact!==null)return {correct:fromReact,source:'QBの新しいReact解答履歴＋公式正答'};
+    const after=answerSnapshots.get(q)?.api;
+    const fromApi=changed?resultFromHistory(after,q):null;
+    if(fromApi!==null)return {correct:fromApi,source:'QBの新しい回答履歴＋公式正答'};
+    // DOM履歴だけの場合も、現在の解答後の履歴が前回履歴と異なることを要求する。
+    const fromDOM=resultFromLatestDOM();
+    const domBaseline=previousSnapshots.get(q)?.domBaseline;
+    const domNow=latestDOMFingerprint();
+    if(fromDOM!==null && domBaseline!==undefined && domNow!==domBaseline)
+      return {correct:fromDOM,source:'QBの新しい解答履歴表示'};
+    // QB自身が今回選択した評価と明示できる場合だけ正誤として採用。
+    // Reactの古いuser_statusを正誤に流用しない。
+    const current=selectedFromGroup();
+    return ['○','×'].includes(current)?{correct:current==='○',source:'QBの選択中の評価'}:null;
+  }
+  function startAnswerLookup(q) {
+    if(!validQuestionUuid(q)||answerSnapshots.has(q))return;
+    const entry={api:null,done:false};
+    answerSnapshots.set(q,entry);
+    entry.promise=getQuestionSnapshot(q).then(item=>{
+      entry.api=item;entry.done=true;
+      if(pending?.q===q)queueScan();
+    });
+  }
+  function previousFromOldHistory(q) {
+    // 最新行は今回の解答。2行目が前回である。
+    // 前回が不正解なら×と確定できるが、正解時の◎/○/△はSVGまたはQB履歴でのみ確定する。
+    const dom=qbVisibleHistoryRows();
+    if(dom.length>=2 && dom[1].label)return {label:dom[1].label,source:'QBの過去解答履歴表'};
+    // QBが新しい解答を記録した後は、answer_histories側に一つ前の記録が入る。
+    const item=answerSnapshots.get(q)?.api||reactHistorySnapshot(q);
+    const attempts=item?.attempt?.answer_histories;
+    if(!Array.isArray(attempts)||attempts.length===0)return null;
+    // 履歴配列は新しいものから順序通りに記録されるときだけ採用する。
+    const first=attempts[0];
+    const label=ratingFromAttempt(first,item.correctAnswers||answerKeys.get(q));
+    return label?{label,source:'QBの前回解答履歴（解答後）'}:null;
+  }
+  // ===== /v0.4.2 =====
+
   // 画面上の信頼できる表示とローカル記録が食い違えば、正解回数を推測しない。
   function previousForQuestion(q) {
     const record=getRecord(q);
@@ -395,14 +725,15 @@
     const preSelected=!hasResultUI()?selectedEvaluation():null;
     if(explicit && preSelected && explicit!==preSelected)
       return {label:null,streak:0,source:'QB表示が矛盾',problem:'異なる評価が同時に表示されている'};
-    const qbLabel=explicit||preSelected;
+    const observed=previouslyObservedLabel(q);
+    const qbLabel=explicit||preSelected||observed?.label;
     if(qbLabel) {
       return {
         label:qbLabel,
         streak:record?.label===qbLabel?record.streak:0,
         lastCreditDay:record?.lastCreditDay||'',
         legacyStreak:record?.label===qbLabel?record.legacyStreak:0,
-        source:explicit?'QBの前回評価表示':'QBの選択済み評価',
+        source:explicit?'QBの前回評価表示':preSelected?'QBの選択済み評価':observed?.source||'QBの解答履歴',
         problem:record && record.label!==qbLabel?'端末内の旧評価とQB表示が不一致。QB表示を優先しカウントを0にした。':''
       };
     }
@@ -489,11 +820,28 @@
   function applySmart(task) {
     if(task.q!==questionId()||config.mode!=='smart'||learning||task.done||task.token!==operationNonce)return false;
     if(!hasResultUI())return false;
-    const current=selectedEvaluation();
-    if(!['○','×'].includes(current))return false;
-    const correct=current==='○';
+    const outcome=resolveCurrentCorrectness(task.q);
+    if(!outcome) {
+      startAnswerLookup(task.q);
+      return false;
+    }
+    const correct=outcome.correct;
+    // QB自身の解答直後の評価は、正解=○/不正解=×。画面UIが明示するときはそちらを優先。
+    const current=selectedEvaluation()|| (correct?'○':'×');
+    // ユーザーが解答直後に評価を手動変更した場合、正誤を評価アイコンから推測せず
+    // 結果表示/APIを優先し、それでも矛盾するときは操作しない。
+    if(outcome.source==='QBの選択中の評価' &&
+       current!==(correct?'○':'×'))return false;
+    // 前回評価が解答直前に取れなかったとき、QBの前回履歴があれば補う。
+    if(!task.before?.label){
+      const prior=previouslyObservedLabel(task.q)||previousFromOldHistory(task.q);
+      if(prior)task.before={...prior,streak:getRecord(task.q)?.label===prior.label?(getRecord(task.q)?.streak||0):0,
+        lastCreditDay:getRecord(task.q)?.lastCreditDay||''};
+    }
     answerContext={q:task.q,correct,token:task.token};
     const result=decideSmart(task.before,correct);
+    // まだGETの読み込み中であれば12秒以内は再評価を継続する。
+    if(!result && previousSnapshots.get(task.q)?.done===false)return false;
     task.done=true;
     // 前回評価を取得できない場合は、推測でQB側や履歴を上書きしない。
     if(!result) {
@@ -508,10 +856,14 @@
     }
     // 後からユーザーが行った明示的な操作より自動処理を優先させない。
     const oldRecord=snapshotRecord(task.q);
-    const finish=()=>{
+    const finish=(attempt=0)=>{
       if(task.token!==operationNonce||questionId()!==task.q||config.mode!=='smart')return;
-      if(selectedEvaluation()!==result.label) {
-        setInfo(`${result.label}への変更をQB画面で確認できず、履歴を更新しなかった。`,'warn');
+      const onPage=selectedEvaluation();
+      if(onPage!==result.label) {
+        // QBの画面は保存反映に時間がかかる場合がある。再クリックせず表示だけ3回確認。
+        if(attempt<3)return window.setTimeout(()=>finish(attempt+1),500);
+        setReason(`今回の判定：前回${task.before.label}・${correct?'正解':'不正解'}→${result.label}。評価ボタンの押下後、QB側の選択状態が検証できなかったため、連続正解記録は変更しなかった。`);
+        setInfo(`${result.label}のボタンを押したが、QBの選択状態を確認できない。評価を画面で確認。`,'warn');
         return;
       }
       rememberAuto(task,result,current,oldRecord);
@@ -521,8 +873,13 @@
       return true;
     }
     const button=findByLabel(result.label);
-    if(!button || selectedState(button)===true) {
-      setInfo(`計算結果${result.label}の評価ボタンを特定できず停止。`,'warn');
+    if(!button) {
+      setReason(`前回${task.before.label}・今回${correct?'正解':'不正解'}を取得。${result.label}のボタンをQB画面で特定できない。下部の「評価ボタン登録」で一度だけ登録すると次回から自動クリックする。`);
+      setInfo(`判定成功・クリック不可：${result.label}のボタンが未認識。設定からボタンを登録。`,'warn');
+      return true;
+    }
+    if(selectedState(button)===true) {
+      window.setTimeout(finish,320);
       return true;
     }
     try {
@@ -770,7 +1127,9 @@
             <details id="fixedTools"><summary>固定モードの設定</summary><div class="detailsContent"><div id="buttons"><button id="train" type="button">ボタン位置を登録</button><button id="apply" type="button">今回の評価に適用</button><button id="forget" type="button">登録解除</button></div></div></details>
           </div>
           <div id="status" role="status" aria-live="polite">待機中</div>
-          <details id="otherSettings"><summary>その他の設定</summary><div class="detailsContent"><button id="resetPosition" type="button">表示位置を右上に戻す</button><div id="foot">初回は評価を変更した後にQBを再読み込みし、保存を確認する。表示上の反映とサーバーへの保存は別である。</div></div></details>
+          <details id="otherSettings"><summary>その他の設定</summary><div class="detailsContent"><div class="small">自動判定で評価ボタンが認識されない場合は、その記号を選んで一度だけQBの本来のボタンを押して登録する。</div>
+            <div class="compact"><select id="calibrateLabel" aria-label="登録する評価"><option value="△">△ボタン</option><option value="×">×ボタン</option><option value="○">○ボタン</option><option value="◎">◎ボタン</option></select><button id="calibrate" type="button">評価ボタンを登録</button></div>
+            <button id="resetPosition" type="button">表示位置を右上に戻す</button><div id="foot">初回は評価を変更した後にQBを再読み込みし、保存を確認する。表示上の反映とサーバーへの保存は別である。</div></div></details>
         </div>
       </section>`;
     document.body.append(host);
@@ -811,6 +1170,15 @@
     };
     bar.addEventListener('pointerup', stopDrag);
     bar.addEventListener('pointercancel', stopDrag);
+    sh.getElementById('calibrate').addEventListener('click',()=>{
+      if(!hasResultUI())return setInfo('解答後に「評価ボタンを登録」を押すこと。','warn');
+      const requested=sh.getElementById('calibrateLabel').value;
+      if(!['◎','○','△','×'].includes(requested))return;
+      learning=!learning || learningTarget!==requested;
+      learningTarget=learning?requested:null;
+      if(learning){pending=null;setInfo(`${requested}の登録待ち。QB画面の${requested}ボタンを1回押す。`, 'warn');}
+      else setInfo('ボタン登録をキャンセルした。');
+    });
     sh.getElementById('resetPosition').addEventListener('click', () => {
       config.position = null;
       positionPanel(null);
@@ -820,10 +1188,11 @@
 
     sh.getElementById('mode').addEventListener('change', e => {
       config.mode = e.target.value;
-      learning = false;
+      learning = false;learningTarget=null;
       pending = null;
       ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;
       save(); refreshUI();
+      if(config.mode==='smart' && !hasResultUI())startPreviousLookup(questionId());
       setInfo(config.mode === 'off'
         ? 'OFF。QB標準の自動評価に戻った。'
         : config.mode==='smart'?'自動判定を有効化。前回評価と正誤を確実に読める問題だけ変更。'
@@ -839,9 +1208,10 @@
       if (config.mode === 'off') return;
       learning = !learning;
       if (learning) {
+        learningTarget=LABELS[config.mode];
         pending = null; // 学習中に自動クリックしない。
         setInfo(`登録待機中。解答後にQBの「${LABELS[config.mode]}」を1回手動でクリック。登録を止める場合は再度ここを押す。`, 'warn');
-      } else {setInfo('ボタンの登録をキャンセルした。');}
+      } else {learningTarget=null;setInfo('ボタンの登録をキャンセルした。');}
     });
     sh.getElementById('forget').addEventListener('click', () => {
       if (config.mode === 'off') return;
@@ -902,10 +1272,14 @@
       if(applySmart(pending)){pending=null;refreshSmartInfo();return;}
     } else if (apply(pending)) {pending = null; return;}
     if (Date.now() >= pending.until) {
+      const taskBeforeIsUnknown=!pending.before?.label;
       const mode=pending.mode, sym = LABELS[mode];
+      const q=pending.q;
+      const details=mode==='smart' ?
+        `前回評価:${taskBeforeIsUnknown?'不明':pending.before.label} ／ 今回正誤:${resolveCurrentCorrectness(q)?'検出済み':'不明'}`:'';
       pending = null;
       setInfo(mode==='smart'
-        ? '前回評価・今回の正誤を確実に読めなかったため、QBの評価を変更していない。'
+        ? `自動処理を停止（${details}）。QBの評価は変更していない。`
         : `${sym}を自動検出できなかった。解答後に「ボタン位置を登録」を使う。QBの評価はそのまま。`, 'warn');
     }
   }
@@ -923,22 +1297,21 @@
     if (learning) {
       // 「解答する」「次の問題」等へのクリックは登録しない。
       if (!hasResultUI() || !validTarget(target)) return;
-      const mode = config.mode;
-      if (mode === 'off') return;
-      const accessibleSymbol = scoreSymbolOf(target);
-      if (accessibleSymbol && accessibleSymbol !== LABELS[mode]) {
-        setInfo(`${LABELS[mode]}ではないボタンは登録しない。`, 'warn');
+      const targetSymbol=learningTarget || LABELS[config.mode];
+      const key=({'△':'triangle','×':'wrong','○':'correct','◎':'perfect'})[targetSymbol];
+      if(!key || !validTarget(target))return;
+      const accessibleSymbol=scoreSymbolOf(target);
+      if(accessibleSymbol && accessibleSymbol!==targetSymbol) {
+        setInfo(`${targetSymbol}以外のボタンを検出。登録は続行する。`, 'warn');
         return;
       }
-      config.learned[mode] = {
-        path: domPath(target),
-        shape: shapeOf(target),
-        tag: target.tagName.toLowerCase(),
+      config.learned[key] = {
+        path: domPath(target),shape: shapeOf(target),tag:target.tagName.toLowerCase(),
       };
-      learning = false;
-      pending = null;
-      save(); refreshUI();
-      setInfo(`${LABELS[mode]}ボタンを登録した。今回は手動操作し、次の問題から自動適用する。`, 'ok');
+      learning=false;learningTarget=null;
+      pending=null;
+      save();refreshUI();
+      setInfo(`${targetSymbol}ボタンを登録した。QB側では今回の手動操作が有効。次回以降は自動クリック。`,'ok');
       return; // 本来のユーザークリックは妨げない。
     }
 
@@ -963,7 +1336,18 @@
     }
     if(config.mode==='off')return;
     if(exactText(target)==='解答する' && isVisible(target) && isEnabled(target)) {
-      const before=config.mode==='smart'?previousForQuestion(questionId()):null;
+      const q=questionId();
+      if(config.mode==='smart') {
+        startPreviousLookup(q);
+        const entry=previousSnapshots.get(q);
+        const currentReact=reactHistorySnapshot(q);
+        if(entry && currentReact){entry.snapshot=currentReact;entry.baseline=attemptFingerprint(currentReact);}
+      }
+      const before=config.mode==='smart'?previousForQuestion(q):null;
+      if(config.mode==='smart'){
+        const entry=previousSnapshots.get(q);
+        if(entry){entry.domBaseline=latestDOMFingerprint();entry.submissionStarted=true;}
+      }
       ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;
       pending={q:questionId(),mode:config.mode,before,
         until:Date.now()+MAX_WAIT,done:false,manual:false,token:operationNonce};
@@ -977,6 +1361,7 @@
   function start() {
     if (!isQuizPage()) return;
     if (!installUI()) return;
+    if(config.mode==='smart' && !hasResultUI())startPreviousLookup(questionId());
     document.addEventListener('click', onUserClick, true);
     const observer = new MutationObserver(() => queueScan());
     observer.observe(document.body, {subtree:true, childList:true, attributes:false});
@@ -994,12 +1379,13 @@
       if (location.href !== lastUrl) {
         lastUrl = location.href;
         pending = null;
-        learning = false;
+        learning = false;learningTarget=null;
         ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;
         setInfo(config.mode === 'off'
           ? 'OFF。通常のQB動作。'
           : config.mode==='smart'? '自動判定モード。判定不能な場合はQBの評価を変更しない。'
           : `${LABELS[config.mode]}固定で待機中。評価対象の問題を絞り込むこと。`);
+        if(config.mode==='smart' && !hasResultUI())startPreviousLookup(questionId());
         refreshSmartInfo();
       }
       // ネットワーク反映などでDOM変化がなくてもタイムアウトを処理する。
