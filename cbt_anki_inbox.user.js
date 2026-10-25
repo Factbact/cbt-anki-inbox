@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.10
-// @description  CBT Medilink専用。移動・サイズ調整できる追加箱。演習情報をコンパクト表示し、産婦人科の分類を補正。
+// @version      6.11
+// @description  CBT Medilink専用。○・◎でもカード化するボタンを常時表示。移動・サイズ調整、演習別保存、科目の自動判定に対応。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @match        https://cbt.medilink-study.com/*
@@ -619,7 +619,7 @@
     return true;
   }
 
-  function toggleAutomaticOverrideForCurrentQuestion() {
+  function addAutomaticOverrideForCurrentQuestion() {
     const question = getCurrentQuestionInfo();
 
     if (!question.qbId) {
@@ -627,9 +627,12 @@
       return;
     }
 
-    setAutomaticOverrideForCurrentQuestion(
-      !isAutomaticOverrideEnabledForQbId(question.qbId)
-    );
+    if (isAutomaticOverrideEnabledForQbId(question.qbId)) {
+      toast("この問題は既にカード化の対象です。解除は一覧から行えます");
+      return;
+    }
+
+    setAutomaticOverrideForCurrentQuestion(true);
   }
 
   function removeAutomaticOverride(sessionId, qbId) {
@@ -2945,6 +2948,13 @@
     選択中の文字・画像を取り込む
   </button>
 
+  <button id="force-auto-current" class="secondary force-auto-button" type="button" aria-describedby="force-auto-help">
+    ＋ ○・◎でもカード化する
+  </button>
+  <div id="force-auto-help" class="force-auto-help">
+    この問題をカード化の対象に指定。JSON書き出し時に反映します。解除は下の一覧から。
+  </div>
+
   <details id="inbox-card-options">
     <summary>自動カード設定・使い方</summary>
   <label class="checkbox-row manual-auto-option">
@@ -2953,13 +2963,6 @@
   </label>
   <div class="manual-auto-help">
     通常はOFF。手動候補を1件でも作った問題は、△/×でも自動カードを作りません。必要なときだけON。
-  </div>
-
-  <button id="force-auto-current" class="secondary force-auto-button" type="button">
-    ○・◎でもこの問題を自動カード化
-  </button>
-  <div class="force-auto-help">
-    手動候補なしでも使えます。押した問題は評価に関係なく自動カードを1枚作成。もう一度押すと解除。
   </div>
 
     <div class="memory-note">選択文字・画像の取り込み：⌥A / Alt+A</div>
@@ -3073,7 +3076,7 @@
       .getElementById("force-auto-current")
       .addEventListener(
         "click",
-        toggleAutomaticOverrideForCurrentQuestion
+        addAutomaticOverrideForCurrentQuestion
       );
 
     shadow.getElementById("capture-current").addEventListener("click", captureCurrentToDraft);
@@ -4119,10 +4122,13 @@
 
     button.classList.toggle("active", active);
     button.textContent = active
-      ? "✓ ○・◎でも自動カード化する"
-      : "○・◎でもこの問題を自動カード化";
+      ? "✓ ○・◎でもカード化：指定済み"
+      : "＋ ○・◎でもカード化する";
 
-    button.disabled = !question.qbId || !isQBQuizPage();
+    button.disabled = active || !question.qbId || !isQBQuizPage();
+    button.title = active
+      ? "この問題は指定済みです。解除は「○・◎でも自動カード指定」の一覧から行えます"
+      : "この問題をカード化の対象に指定します。JSON書き出し時に反映されます";
   }
 
   function renderCurrentAutomaticOverrideList() {
@@ -5140,7 +5146,9 @@
     const counts = root.querySelector(".count-row");
     const exporter = root.getElementById("run-qb-exporter");
     const save = root.getElementById("save-candidate");
-    if (!panel || !content || !header || !counts || !exporter || !save) return;
+    const forceAuto = root.getElementById("force-auto-current");
+    const forceAutoHelp = root.getElementById("force-auto-help");
+    if (!panel || !content || !header || !counts || !exporter || !save || !forceAuto || !forceAutoHelp) return;
 
     const style = document.createElement("style");
     style.id = "inbox-pinned-style";
@@ -5172,6 +5180,9 @@
       #inbox-pinned-header .count-row { margin-bottom: 8px; }
       #inbox-pinned-header .run-qb,
       #inbox-pinned-footer .primary { margin-top: 0; }
+      #inbox-pinned-footer .force-auto-button { margin-top: 6px; }
+      #inbox-pinned-footer .force-auto-button:disabled.active { opacity: 1; cursor: default; }
+      #inbox-pinned-footer .force-auto-help { margin: 4px 0 0; font-size: 10px; }
       #inbox-pinned-header .header {
         cursor: grab; touch-action: none; user-select: none;
         gap: 8px;
@@ -5278,7 +5289,7 @@
     const bottom = document.createElement("div");
     bottom.id = "inbox-pinned-footer";
     top.append(header, counts, exporter);
-    bottom.append(save);
+    bottom.append(save, forceAuto, forceAutoHelp);
     panel.insertBefore(top, content);
     panel.append(bottom);
     root.append(style);
@@ -5302,3 +5313,4 @@
   const observer = new MutationObserver(pinInboxActions);
   observer.observe(document.documentElement, { childList: true, subtree: true });
 })();
+
