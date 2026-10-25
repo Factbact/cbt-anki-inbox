@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.7
-// @description  前回評価の遅延取得・再演習時の取り直し・解答履歴のSVG読取を修正。評価ルールとサイズ変更を維持。
+// @version      0.4.8
+// @description  表示中の直近3件も安全に昇格判定へ利用。「自信なし」を取り消すと評価と正解回数を復元。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -12,7 +12,7 @@
 // ==/UserScript==
 
 /*
- * QB CBT 復習ラベル管理 0.4.7
+ * QB CBT 復習ラベル管理 0.4.8
  *
  * ■ スマートモード（手動で有効化、初期値OFF）
  *   前回 ◎/○/△/× と今回の正解/不正解で評価を更新。
@@ -365,6 +365,11 @@
       legacyStreak:modern ? clampCount(r.legacyStreak) : clampCount(r.streak),
       lastCreditDay:modern && validDay(r.lastCreditDay) ? r.lastCreditDay : '',
       updatedAt:Number.isFinite(Number(r.updatedAt)) ? Number(r.updatedAt) : 0,
+      // 手動の△・自信なしより前の正解履歴は、再昇格の証拠に使わない。
+      resetAt:Number.isFinite(Number(r.resetAt)) && Number(r.resetAt)>0
+        ? Number(r.resetAt)
+        : (['自信なし','手動変更','手動登録'].includes(r.source) &&
+            Number.isFinite(Number(r.updatedAt)) ? Number(r.updatedAt) : 0),
       source:typeof r.source==='string' ? r.source.slice(0,80) : '旧記録',
     };
   }
@@ -434,6 +439,9 @@
     return replaceRecord(q,{
       ...(previous||{}), ...options,
       schema:HISTORY_SCHEMA, label, streak:clampCount(streak),
+      // 手動で評価し直した日を境界として保存し、古い○○○を誤って流用しない。
+      resetAt:['自信なし','手動変更','手動登録'].includes(source)
+        ? Date.now() : (previous?.resetAt||0),
       updatedAt:Date.now(), source
     });
   }
@@ -947,9 +955,29 @@
     if(record)return {...record,source:record.source==='手動登録'?'本人が登録した前回評価':record.source==='手動変更'?'手動評価の記録':'このブラウザの保存履歴'};
     return {label:null,streak:0,lastCreditDay:'',source:'不明',problem:'前回評価が取得できない'};
   }
+  // QB画面で見える「今回＋前回＋前々回」の3件を補助証拠にする。
+  // 3件未満、同日の重複、×混在、自信なし・手動リセットより前なら昇格しない。
+  // 表に3件しかない場合も、条件を満たす3日分が揃えば判定可能。
+  function historyPromotionEvidence(q,correct) {
+    if(correct!==true)return null;
+    const rows=freshDOMHistory(q);
+    if(!rows||rows.length<3)return null;
+    const three=rows.slice(0,3);
+    if(three.some(row=>row.correct!==true || !validDay(row.day)))return null;
+    const days=three.map(row=>row.day);
+    if(new Set(days).size!==3)return null;
+    const resetAt=getRecord(q)?.resetAt||0;
+    if(resetAt>0) {
+      const resetDay=studyDay(new Date(resetAt));
+      // リセットと同じ日またはその前の履歴を含むなら使わない。
+      if(days.some(d=>d<=resetDay))return null;
+    }
+    return {days,source:'QBの最新3件（異なる3日）の正解履歴'};
+  }
+
   // 正答の最大加算回数は「問題ごと、JSTの日付ごと」に1回。
   // ×へ戻っても当日加算済みの日付は保持し、同日に解き直して数を増やせないようにする。
-  function decideSmart(before,correct,day=studyDay()) {
+  function decideSmart(before,correct,day=studyDay(),historyEvidence=null) {
     if(!before || !LABEL_SET.includes(before.label) || typeof correct!=='boolean' || !validDay(day))return null;
     const prior=before.label, old=clampCount(before.streak);
     const creditDay=validDay(before.lastCreditDay)?before.lastCreditDay:'';
@@ -960,14 +988,20 @@
     if(prior==='○'||prior==='未演習')return {label:'○',streak:0,lastCreditDay:creditDay,
       explanation:prior==='○'?'前回○・今回も正解なので○を維持。':'初回正解なので○に設定。'};
     const duplicate=creditDay===day;
-    const count=duplicate?old:Math.min(3,(prior==='×'?0:old)+1);
+    const localCount=duplicate?old:Math.min(3,(prior==='×'?0:old)+1);
+    // 端末を替えたなどでローカル回数が不足しても、QBの直近3件が
+    // 独立した3学習日で、手動リセット以前でなければ証拠にできる。
+    const verifiedThree=historyEvidence?.days?.length===3 &&
+      historyEvidence.days.includes(day);
+    const count=verifiedThree?3:localCount;
     // 当日すでに正解加算されていたのに直前が×なら、0回の△として開始。
     const label=count>=3?'○':'△';
     return {
       label,streak:label==='○'?0:count,
       lastCreditDay:duplicate?creditDay:day,
-      explanation:duplicate
-        ? `本日(${day})は加算済みのため連続回数を増やさず${label}にする。`
+      explanation:verifiedThree
+        ? `QBの直近3件が異なる3日の正解と確認できたため○へ昇格。`
+        : duplicate ? `本日(${day})は加算済みのため連続回数を増やさず${label}にする。`
         : label==='○'?`異なる学習日で3回連続正解。${day}に○へ昇格。`
         : `${day}の正解を1回加算。現在${count}/3回。`
     };
@@ -997,8 +1031,10 @@
       `${legacy?` ／ 旧版${legacy}回（日付不明・昇格に使わない）`:''}`+
       ` ／ 根拠：${before.source}`;
     sh.getElementById('smartReason').textContent=lastDecision?.q===q?lastDecision.text:(before.problem||'問題ごとの評価を確認中。');
-    sh.getElementById('unsure').disabled=!(config.mode==='smart' && answerContext?.q===q && answerContext.correct && !pending && hasResultUI());
+    const unsureActive=lastAutomatic?.q===q && lastAutomatic.kind==='unsure';
+    sh.getElementById('unsure').disabled=!(config.mode==='smart' && answerContext?.q===q && answerContext.correct && !answerContext.unsure && !unsureActive && !pending && hasResultUI());
     sh.getElementById('undo').disabled=!(config.mode==='smart' && lastAutomatic?.q===q && !pending);
+    sh.getElementById('undo').textContent=unsureActive?'自信なしを取り消す':'取り消す';
   }
   function rememberAuto(task,result,beforeQB,oldRecord) {
     if(!storeRecord(task.q,result.label,result.streak,'自動判定',{
@@ -1034,7 +1070,8 @@
         problem:'ブラウザ内の旧評価だけでは確定せず、QBの前回履歴を再取得している'};
     }
     answerContext={q:task.q,correct,token:task.token};
-    const result=decideSmart(task.before,correct);
+    const evidence=historyPromotionEvidence(task.q,correct);
+    const result=decideSmart(task.before,correct,studyDay(),evidence);
     // DOM history and React state can arrive after the result banner. A finished
     // metadata GET does not mean that the user's history has finished loading.
     if(!result && Date.now()<task.until) {
@@ -1101,14 +1138,19 @@
       return setInfo('履歴が別の操作で変わったため、自動取り消しを中止。','warn');
     if(!storageReady())return setInfo('ローカル履歴に書き込めないため、取り消しを中止。','error');
     ++operationNonce;
+    // 自信なしを取り消したら、元の正解状況と直前の自動評価も復元する。
+    const restoreAnswer=undo.kind==='unsure'?cloneData(undo.answerBefore):null;
+    const restoreAutomatic=undo.kind==='unsure'?cloneData(undo.previousAutomatic):null;
     answerContext=null;
     const finish=()=>{
       if(questionId()!==q || selectedEvaluation()!==undo.beforeQB)
         return setInfo('元の評価への画面反映を確認できず、履歴は戻していない。','warn');
       if(!replaceRecord(q,undo.oldRecord))return;
-      lastAutomatic=null;
-      setReason(`自動評価を取り消し、QB評価を${undo.beforeQB}に、ローカル履歴を操作前に復元した。QBの解答履歴は変更していない。`);
-      setInfo('直前の自動評価を取り消した（画面上で確認）。','ok');
+      lastAutomatic=restoreAutomatic;
+      answerContext=restoreAnswer;
+      const label=undo.kind==='unsure'?'自信なし':'自動評価';
+      setReason(`${label}を取り消し、QB評価を${undo.beforeQB}に、ローカル履歴を操作前に復元した。QBの解答履歴は変更していない。`);
+      setInfo(`${label}の直前の状態に戻した（画面上で確認）。`,'ok');
       refreshSmartInfo();
     };
     if(undo.beforeQB===undo.afterQB)return finish();
@@ -1119,27 +1161,36 @@
   }
   function markUnsure() {
     const q=questionId();
-    if(config.mode!=='smart'||answerContext?.q!==q||!answerContext.correct||!hasResultUI())
+    if(config.mode!=='smart'||answerContext?.q!==q||!answerContext.correct||!hasResultUI()||pending)
       return setInfo('今回の正解を確定できないため、「自信なし」は利用できない。','warn');
+    if(answerContext.unsure || (lastAutomatic?.q===q&&lastAutomatic.kind==='unsure'))
+      return setInfo('既に「自信なし」を適用済み。取り消す場合は右のボタンを押す。','warn');
     const current=selectedEvaluation();
     if(!['◎','○','△','×'].includes(current))
       return setInfo('QBの評価を読み取れないため、自信なしの変更を中止。','warn');
     if(!storageReady())return setInfo('履歴を保存できないため、自信なしを中止。','error');
-    ++operationNonce;pending=null;lastAutomatic=null;
-    // 同日の正解加算を手動リセットで再利用できないよう、加算済みの日付は維持。
+    const button=current==='△'?null:findByLabel('△');
+    if(current!=='△'&&!button)return setInfo('△の評価ボタンを特定できないため停止。','warn');
+    const oldRecord=snapshotRecord(q);
+    const previousAutomatic=lastAutomatic?.q===q?cloneData(lastAutomatic):null;
+    const answerBefore=cloneData(answerContext);
     const lastCreditDay=getRecord(q)?.lastCreditDay||'';
-    answerContext=null;
+    const token=++operationNonce;
+    pending=null;
     const finish=()=>{
-      if(questionId()!==q)return;
-      if(selectedEvaluation()!=='△')return setInfo('△への画面反映を確認できなかったため、履歴を変更していない。','warn');
+      if(questionId()!==q || token!==operationNonce)return;
+      if(selectedEvaluation()!=='△')
+        return setInfo('△への画面反映を確認できなかったため、履歴を変更していない。','warn');
       if(storeRecord(q,'△',0,'自信なし',{lastCreditDay,legacyStreak:0})) {
-        setReason('正解したが自信なしと判断。△にし、連続正解回数を0にした。当日の既加算は再利用しない。');
-        setInfo('自信なし：△・連続正解0回に変更した。','ok');
+        lastAutomatic={kind:'unsure',q,beforeQB:current,afterQB:'△',oldRecord,
+          newRecord:snapshotRecord(q),token,previousAutomatic,answerBefore};
+        answerContext={...answerBefore,unsure:true};
+        setReason('正解したが自信なしと判断。△にし、連続正解回数を0にした。取り消すと直前の状態に戻す。');
+        setInfo('自信なしを適用した。右の「自信なしを取り消す」で元の評価・回数へ戻せる。','ok');
+        refreshSmartInfo();
       }
     };
     if(current==='△')return finish();
-    const button=findByLabel('△');
-    if(!button)return setInfo('△の評価ボタンを特定できないため停止。','warn');
     try{button.click();window.setTimeout(finish,650);}
     catch(e){setInfo(`自信なし操作に失敗：${String(e.message||e)}`,'error');}
   }
