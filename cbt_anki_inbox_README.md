@@ -1,35 +1,27 @@
-# QB版 Anki追加箱 v6.16
+# QB版 Anki追加箱 v6.17
 
 [Tampermonkeyで更新](https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js)
 
-リンク先のバージョンが6.16であることを確認し、既存の「CBT Anki 追加箱」を更新してQBを再読み込みする。保存済みの候補・設定を削除する必要はない。既に開いている旧Exporterは必要な保存を済ませて手動で閉じ、更新後のQB画面から起動し直す。
+リンク先のバージョンが6.17であることを確認し、既存の「CBT Anki 追加箱」を更新してQBを再読み込みする。保存済みの候補・設定を削除する必要はない。既に開いている旧Exporterは必要な保存を済ませて手動で閉じ、更新後のQB画面から起動し直す。
 
-## v6.16：通常ダウンロードも5秒後に閉じる
+## v6.17：ダウンロード回帰の最小修正
 
-- 対応環境の `GM_download` 経路は、従来どおり保存成功通知後に専用Exporterだけ閉じる。通常ダウンロードの経路では、全件取得後にダウンロード要求が例外なく行われた場合だけ5秒後に閉じる。保存先選択や保存確認クリックは追加しない。
-- 通常ダウンロードでは「5秒後に閉じます（保存完了は未確認）」と表示し、「閉じるのをやめる」で取消できる。この経路は保存成功を検出していないため、ブラウザ側の保存拒否・遅延・中断を検知できない。保存済み通知も送らない。
-- 保存先はブラウザ既定のダウンロード先、ファイル名は従来の `qb_<取得問数>questions_with_answers_manual_<手動候補数>.json`。例：`qb_22questions_with_answers_manual_4.json`。同名ファイルは上書きせずブラウザが連番等を付ける。
-- 両経路とも取得失敗・途中停止・部分取得・画像取得失敗では閉じない。検知できたダウンロード例外、GM_downloadの失敗・取消・タイムアウトでも閉じない。再取得・再保存・停止・画面遷移は古い終了タイマーを取り消す。QB本体や遷移後の別画面は閉じない。
-- 通常ダウンロード用Blob URLはQB本体側で作成し、Exporter終了時には解放しない。本体を閉じたり再読み込みした場合にはURLが解放されるため、実際の保存完了までの保証はない。
-- v6.15で追加したgrantは `GM_download` のみ。v6.16では権限追加なし。既存の接続範囲・他の権限は拡張しない。`GM_info` で実行中の拡張名・バージョン・ダウンロードモードを読み、設定は自動変更しない。
+- v6.15/v6.16で追加した `GM_download`、親画面のBlob URL生成、画面をまたぐ保存callbackを撤去。v6.12/v6.14と同じExporter内の `Blob → URL.createObjectURL → a.download → a.click()` に戻す。Browser API設定や追加権限は不要。新しい権限を追加しない。
+- 保存名は元の `qb_<取得問数>questions_with_answers_manual_<手動候補数>.json`、保存先はブラウザ既定のダウンロード先。JSON内容と整形もv6.12の生成処理を維持する。
+- 全件取得してダウンロード要求が例外なく行われた場合だけ、取消可能な5秒タイマーで専用Exporterを閉じる。保存完了の検出ではなく、ダウンロードの遅延・拒否等は確認できない旨を画面に表示する。
+- 取得失敗・途中停止・部分取得・画像取得失敗・検知した保存例外では閉じない。保存例外は画面に表示し、再保存ボタンを残す。再取得・再保存・取消・ページ遷移で古い終了タイマーを取り消す。
+- 終了対象はExporter自身が保持したdocumentとHTMLルート、opener、URLで確認する。外側のuserscriptから渡したdocumentとの厳密比較に依存しない。QB本体・別画面・再利用されたwindowを閉じない。
+- Blob URLをタイマーから明示的に解放しない。ただしExporterを閉じた際のブラウザの解放や保存完了は保証できない。
 
-### 最初の一度だけ必要な確認
+### 確認できたこと・未確認のこと
 
-1. 上の更新リンクでv6.16に更新し、追加されるダウンロード権限の表示があれば確認する。
-2. Tampermonkeyのダッシュボード → 設定 → Downloads（ダウンロード）で Download Mode を Browser API にする必要がある。既に設定済みなら変更不要。項目が見えない場合は設定表示モードをAdvanced（詳細）にする。ブラウザからダウンロード権限の確認が出た場合は本人が許可する。
-3. JSONが許可されていないというエラーが出た場合だけ、同じDownloadsの「Whitelisted File Extensions」で `.json` を許可する。既存の許可項目を削除したり全拡張子を許可したりしない。
-4. QBを再読み込みし、旧Exporterを必要な保存後に閉じ、Anki追加箱の「QB取得ツール」から起動し直す。
+v6.16には、親windowとラップされたwindowの厳密同一性が異なる場合にURL生成前にthrowする経路、およびGM_downloadの失敗／callback不発時に通常ダウンロードへ進まない経路があった。前者は実コードを用いたVMモデルで再現。今回その両経路を除去した。ただし本人環境の実際の原因は未確定であり、「GM_download追加で初めてsandbox化した」とは判断していない（以前からGM系grantあり）。
 
-対応条件はTampermonkeyのBlob対応版（安定版5.4.0以降、5.4系開発版は5.4.6226以降）、Browser APIモード、GM_downloadが利用可能なこと。旧版・非対応拡張・native/disabledモード・単体のコピー実行では従来の通常ダウンロードを行い、全件取得・要求成功時だけ5秒後に閉じる（保存完了は未確認）。
-
-52件のローカルテストと構文チェックに合格。実ユーザー環境の拡張バージョン・設定・権限・保存および終了動作は未検証。ブラウザや組織のポリシー、他のダウンロード管理機能がファイル名や保存先を変更する可能性はある。
-
-[GM_download公式仕様](https://www.tampermonkey.net/documentation.php?locale=en&q=GM_download) / [公式設定説明](https://www.tampermonkey.net/faq.php?locale=en&q=Q302)
+34件のローカル模擬テストと構文チェック、v6.12とのJSON生成・命名の比較に合格。実Chromeで合成JSONの保存を試す準備をしたが、オフライン検証ページのURL方式がブラウザセキュリティポリシーに拒否されたため中止。禁止されたlocalhostや別経路での迂回は行っていない。実ブラウザでの保存ファイル取得・閉じる動作、実Tampermonkeyのsandboxは未検証。
 
 ```sh
 deno check cbt_anki_inbox.user.js
-deno run --allow-read=. tests/cbt_anki_inbox_v615_download.test.mjs
-deno run --allow-read=. tests/cbt_anki_inbox_v615_controller.test.mjs
+deno run --allow-read=. tests/cbt_anki_inbox_v617_controller.test.mjs
 deno run --allow-read=. tests/cbt_anki_inbox_v611.test.mjs
 deno run --allow-read=. tests/cbt_anki_inbox_v612.test.mjs
 ```
