@@ -4,7 +4,7 @@ import vm from 'node:vm';
 const source=fs.readFileSync(new URL('../cbt_anki_inbox.user.js',import.meta.url),'utf8');
 const exporter=JSON.parse(source.match(/const QB_EXPORTER_CODE = (".*");/)[1]);
 function harness(options={}) {
-  const sim={managedCalls:[],closed:0,downloads:0,filenames:[],messages:[],writes:[],aborts:0,timers:new Map(),seq:0,pickerCalls:0,docReads:0,manual:[],...options};
+  const sim={parentBlobs:[],managedCalls:[],closed:0,downloads:0,filenames:[],messages:[],writes:[],aborts:0,timers:new Map(),seq:0,pickerCalls:0,docReads:0,manual:[],...options};
   const nodes=new Map();
   function node(id) {
     if(!nodes.has(id))nodes.set(id,{checked:id==='autoClose',hidden:false,disabled:false,textContent:'',listeners:{},
@@ -14,8 +14,9 @@ function harness(options={}) {
   const doc={body:{appendChild(){}},getElementById:node,createElement(){return {click(){if(sim.downloadError)throw Error('blocked');sim.downloads++;sim.filenames.push(this.download)},remove(){}}}};
   const qb={closed:false,document:{body:{}},postMessage(m){sim.messages.push(m)}};
   const w={opener:qb,location:{href:'about:blank'},__QB_EXPORTER_OWNED_DOCUMENT__:doc,
-    close(){sim.closed++},__CBT_ANKI_EXERCISE_SESSION__:{id:'s'}};
+    listeners:{},addEventListener(event,fn){this.listeners[event]=fn},close(){sim.closed++},__CBT_ANKI_EXERCISE_SESSION__:{id:'s'}};
   w.top=w;
+  w.__QB_EXPORTER_CREATE_URL__=blob=>{sim.parentBlobs.push(blob);return 'blob:parent'};
   if(options.managed) w.__QB_INBOX_MANAGED_DOWNLOAD__=async(json,name)=>{
     sim.managedCalls.push({json,name});await sim.pendingSave;
     if(sim.saveError)throw Error('save failed');
@@ -62,8 +63,12 @@ for(const key of ['saveError','badReceipt'])await test(`${key} keeps popup and r
   const h=harness({managed:true,[key]:true});await h.T.run();assert.equal(h.sim.closed,0);assert.equal(h.sim.downloads,0);assert.equal(h.sim.messages.length,0);assert.equal(h.node('download').disabled,false);
   h.sim[key]=false;await h.node('download').click();assert.equal(h.sim.closed,1);
 });
-await test('unsupported or copied exporter keeps ordinary download, never timer-closes',async()=>{
-  const h=harness();await h.T.run();h.flush();assert.equal(h.sim.downloads,1);assert.equal(h.sim.closed,0);assert.equal(h.sim.pickerCalls,0);
+await test('fallback downloads under original name then closes after five seconds without claiming saved',async()=>{
+  const h=harness();await h.T.run();assert.equal(h.sim.downloads,1);assert.equal(h.sim.closed,0);assert.equal(h.sim.pickerCalls,0);
+  assert.equal(h.sim.timers.size,1);assert.equal(h.node('cancelFallbackClose').hidden,false);
+  assert.match(h.node('saveStatus').textContent,/5秒後.*保存完了は未確認/);
+  assert.equal(h.sim.parentBlobs.length,1);assert.equal(h.T.prepared.url,'blob:parent');
+  h.flush();assert.equal(h.sim.closed,1);assert.equal(h.qb.closed,false);assert.equal(h.sim.messages.length,0);
 });
 for(const kind of ['partial','stopped','imageFailure'])await test(`${kind} saves but does not close or complete the session`,async()=>{
   const h=harness({managed:true});if(kind==='stopped')h.T.setStop(true);if(kind==='imageFailure')h.sim.manual=[{images:[{embedError:'failed'}]}];
@@ -80,5 +85,35 @@ await test('navigation or replaced document prevents close',async()=>{
 });
 await test('failed restart cannot close from a previous successful batch',async()=>{
   const h=harness({managed:true});await h.T.run();const n=h.sim.closed;h.sim.missingDoc=true;await h.T.run();assert.equal(h.sim.closed,n);
+});
+await test('fallback cancellation invalidates even an already queued timer callback',async()=>{
+  const h=harness();await h.T.run();const callback=[...h.sim.timers.values()][0];h.node('cancelFallbackClose').click();h.flush();callback();assert.equal(h.sim.closed,0);assert.equal(h.sim.timers.size,0);assert.equal(h.node('cancelFallbackClose').hidden,true);
+});
+await test('fallback anchor exception never schedules close or claims completion',async()=>{
+  const h=harness({downloadError:true});await h.T.run();assert.equal(h.sim.timers.size,0);h.flush();assert.equal(h.sim.closed,0);assert.equal(h.sim.messages.length,0);
+});
+for(const kind of ['partial','stopped','imageFailure'])await test(`fallback ${kind} does not schedule close`,async()=>{
+  const h=harness();if(kind==='stopped')h.T.setStop(true);if(kind==='imageFailure')h.sim.manual=[{images:[{embedError:'failed'}]}];
+  await h.T.prepareDownload(rows,kind==='partial'?2:1,kind==='partial'?'failed':null);assert.equal(h.sim.downloads,1);assert.equal(h.sim.timers.size,0);h.flush();assert.equal(h.sim.closed,0);
+});
+await test('fallback restart and stop cancel previous timer',async()=>{
+  for(const action of ['restart','stop']){const h=harness();await h.T.run();if(action==='restart'){h.sim.missingDoc=true;await h.T.run()}else h.node('stop').click();h.flush();assert.equal(h.sim.closed,0);}
+});
+await test('fallback navigation, new document, replaced ownership marker and iframe never close',async()=>{
+  for(const change of [h=>h.w.location.href='https://example.invalid',h=>h.context.document={},h=>h.w.__QB_EXPORTER_OWNED_DOCUMENT__={},h=>h.w.top={}]){
+    const h=harness();await h.T.run();change(h);h.flush();assert.equal(h.sim.closed,0);
+  }
+});
+await test('fallback resave resets countdown and old callback cannot close',async()=>{
+  const h=harness();await h.T.run();const old=[...h.sim.timers.values()][0];await h.node('download').click();assert.equal(h.sim.timers.size,1);old();assert.equal(h.sim.closed,0);h.flush();assert.equal(h.sim.closed,1);
+});
+await test('navigation cancels timer even if the original document is later restored',async()=>{
+  const h=harness();await h.T.run();h.w.listeners.pagehide();h.flush();assert.equal(h.sim.closed,0);assert.equal(h.sim.timers.size,0);
+});
+await test('actual parent URL factory creates parent-owned Blob without revocation on popup close',()=>{
+  const parent={},doc={},controller={opener:parent,closed:false,document:doc,location:{href:'about:blank'}},registry=[];
+  const context=vm.createContext({controller,window:parent,ownedDocument:doc,Blob,URL:{createObjectURL:blob=>{registry.push(blob);return 'blob:parent'},revokeObjectURL(){throw Error('unexpected revoke')}}});
+  const a=exporter.indexOf('  controller.__QB_EXPORTER_CREATE_URL__ =');const b=exporter.indexOf('  controller.__QB_INBOX_MANAGED_DOWNLOAD__',a);
+  vm.runInContext(exporter.slice(a,b),context);assert.equal(controller.__QB_EXPORTER_CREATE_URL__(new Blob(['{}'])),'blob:parent');controller.closed=true;assert.equal(registry.length,1);assert.throws(()=>controller.__QB_EXPORTER_CREATE_URL__(new Blob(['{}'])));
 });
 console.log(`${count} controller tests passed`);
