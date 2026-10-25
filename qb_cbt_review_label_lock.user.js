@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.8
-// @description  表示中の直近3件も安全に昇格判定へ利用。「自信なし」を取り消すと評価と正解回数を復元。
+// @version      0.4.9
+// @description  コンパクトな復習パネル。判定の待機・停止理由と必要な対処、正解日の加算・昇格根拠を表示。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -12,7 +12,7 @@
 // ==/UserScript==
 
 /*
- * QB CBT 復習ラベル管理 0.4.8
+ * QB CBT 復習ラベル管理 0.4.9（ローカル検証版）
  *
  * ■ スマートモード（手動で有効化、初期値OFF）
  *   前回 ◎/○/△/× と今回の正解/不正解で評価を更新。
@@ -96,6 +96,7 @@
   let lastAutomatic = null; // 同じ問題で行った直前の自動評価のみ復元できる。
   let answerContext = null; // 今回の解答が正解かどうかの確定情報。
   let lastDecision = null;
+  let progressNotice = null; // 表示専用。保存履歴や判定ルールには使わない。
   // QBがアイコン(SVG)だけで評価を表示している場合にも、既存の解答履歴を照会する。
   // GETは同一オリジンの読み取り専用。QBの成績を変更するAPIは呼ばない。
   const previousSnapshots = new Map();
@@ -1010,6 +1011,17 @@
     lastDecision={q:questionId(),text};
     refreshSmartInfo();
   }
+  function progressSummary(before, result, day, evidence) {
+    if(result.label==='×')return '今回は不正解。正解日のカウントを0に戻した。';
+    if(before.label==='◎')return '◎を維持。自動では◎への昇格を行わない。';
+    if(before.label==='○')return '○を維持。自動では◎への昇格を行わない。';
+    if(before.label==='未演習')return '初回の正解なので○にした。';
+    if(evidence?.days?.length===3 && evidence.days.includes(day))
+      return `○へ昇格。QB履歴の異なる3日（${evidence.days.join('・')}）の正解を確認。`;
+    if(result.label==='○')return '○へ昇格。このブラウザの記録で、異なる3学習日の連続正解を確認。';
+    if(before.lastCreditDay===day)return `今日は加算済み。追加加算なし、現在${result.streak}/3日。`;
+    return `今日の正解を1日分加算。現在${result.streak}/3日、○まであと${3-result.streak}日。`;
+  }
   function refreshSmartInfo() {
     if(!ui)return;
     const sh=ui.shadow;
@@ -1031,26 +1043,33 @@
       `${legacy?` ／ 旧版${legacy}回（日付不明・昇格に使わない）`:''}`+
       ` ／ 根拠：${before.source}`;
     sh.getElementById('smartReason').textContent=lastDecision?.q===q?lastDecision.text:(before.problem||'問題ごとの評価を確認中。');
+    sh.getElementById('progressNote').textContent=progressNotice?.q===q ? progressNotice.text
+      : shownLabel==='△' ? `異なる学習日の正解を${Math.min(3,count)}/3日記録。1日1回まで加算。`
+      : shownLabel==='×' ? '次の正解で△。異なる3学習日の連続正解で○へ。'
+      : shownLabel==='○'||shownLabel==='◎' ? `${shownLabel}は正解なら維持。不正解なら×。`
+      : '評価の根拠を確認中。正解日は日本時間で数える。';
     const unsureActive=lastAutomatic?.q===q && lastAutomatic.kind==='unsure';
     sh.getElementById('unsure').disabled=!(config.mode==='smart' && answerContext?.q===q && answerContext.correct && !answerContext.unsure && !unsureActive && !pending && hasResultUI());
     sh.getElementById('undo').disabled=!(config.mode==='smart' && lastAutomatic?.q===q && !pending);
     sh.getElementById('undo').textContent=unsureActive?'自信なしを取り消す':'取り消す';
   }
-  function rememberAuto(task,result,beforeQB,oldRecord) {
+  function rememberAuto(task,result,beforeQB,oldRecord,evidence) {
     if(!storeRecord(task.q,result.label,result.streak,'自動判定',{
       lastCreditDay:result.lastCreditDay,legacyStreak:0
     }))return false;
     lastAutomatic={q:task.q,beforeQB,afterQB:result.label,oldRecord,
       newRecord:snapshotRecord(task.q),token:task.token};
+    progressNotice={q:task.q,text:progressSummary(task.before,result,task.decisionDay||studyDay(),evidence)};
     setReason(result.explanation+'（QB画面上の選択状態まで確認。サーバーへの永続保存は未検証。）');
-    setInfo(`${task.before.label} + ${answerContext?.correct?'正解':'不正解'} → ${result.label} ／ ${result.streak}/3日。`, 'ok');
+    setInfo(`${task.before.label} → ${result.label}。QB画面で反映を確認した。`, 'ok');
     return true;
   }
   function applySmart(task) {
     if(task.q!==questionId()||config.mode!=='smart'||learning||task.done||task.token!==operationNonce)return false;
-    if(!hasResultUI())return false;
+    if(!hasResultUI()) {setAssistStatus('reading-result');return false;}
     const outcome=resolveCurrentCorrectness(task.q);
     if(!outcome) {
+      setAssistStatus('reading-result');
       startAnswerLookup(task.q);
       return false;
     }
@@ -1071,12 +1090,13 @@
     }
     answerContext={q:task.q,correct,token:task.token};
     const evidence=historyPromotionEvidence(task.q,correct);
-    const result=decideSmart(task.before,correct,studyDay(),evidence);
+    task.decisionDay=studyDay();
+    const result=decideSmart(task.before,correct,task.decisionDay,evidence);
     // DOM history and React state can arrive after the result banner. A finished
     // metadata GET does not mean that the user's history has finished loading.
     if(!result && Date.now()<task.until) {
       startAnswerLookup(task.q);
-      setInfo('前回評価を読み込み中。解答履歴の表示を待っている。');
+      setAssistStatus('reading-previous');
       return false;
     }
     task.done=true;
@@ -1085,12 +1105,12 @@
       const rows=qbVisibleHistoryRows();
       const entry=previousSnapshots.get(task.q);
       setReason(`前回評価の読取が未確定。解答前の記録:${previouslyObservedLabel(task.q)?.label||'なし'} / 解答履歴:${rows.length}行 / 前回行の評価:${rows.length>1?(rows[1].label||'アイコン未認識'):'前回行なし'}。今回の評価を前回として代用せず停止した。`);
-      setInfo('前回評価の根拠を取得できず、この問題の自動変更を停止。判定の詳細を確認。','warn');
+      setAssistStatus('missing-previous');
       refreshSmartInfo();
       return true;
     }
     if(!storageReady()) {
-      setInfo('履歴保存が使えないため、QB評価の自動変更を中止した。','error');
+      setAssistStatus('storage-unavailable');
       return true;
     }
     // 後からユーザーが行った明示的な操作より自動処理を優先させない。
@@ -1102,10 +1122,10 @@
         // QBの画面は保存反映に時間がかかる場合がある。再クリックせず表示だけ3回確認。
         if(attempt<3)return window.setTimeout(()=>finish(attempt+1),500);
         setReason(`今回の判定：前回${task.before.label}・${correct?'正解':'不正解'}→${result.label}。評価ボタンの押下後、QB側の選択状態が検証できなかったため、連続正解記録は変更しなかった。`);
-        setInfo(`${result.label}のボタンを押したが、QBの選択状態を確認できない。評価を画面で確認。`,'warn');
+        setAssistStatus('unconfirmed',result.label);
         return;
       }
-      rememberAuto(task,result,current,oldRecord);
+      rememberAuto(task,result,current,oldRecord,evidence);
     };
     if(result.label===current) {
       window.setTimeout(finish,320);
@@ -1114,7 +1134,7 @@
     const button=findByLabel(result.label);
     if(!button) {
       setReason(`前回${task.before.label}・今回${correct?'正解':'不正解'}を取得。${result.label}のボタンをQB画面で特定できない。未登録のアイコン形式の場合のみ一度登録すると、同じ画面形式の別問題にも引き継ぐ。`);
-      setInfo(`判定成功・クリック不可：${result.label}のボタンが未認識。設定からボタンを登録。`,'warn');
+      setAssistStatus('missing-button',result.label);
       return true;
     }
     if(selectedState(button)===true) {
@@ -1148,6 +1168,7 @@
       if(!replaceRecord(q,undo.oldRecord))return;
       lastAutomatic=restoreAutomatic;
       answerContext=restoreAnswer;
+      progressNotice=undo.kind==='unsure'?cloneData(undo.progressBefore):null;
       const label=undo.kind==='unsure'?'自信なし':'自動評価';
       setReason(`${label}を取り消し、QB評価を${undo.beforeQB}に、ローカル履歴を操作前に復元した。QBの解答履歴は変更していない。`);
       setInfo(`${label}の直前の状態に戻した（画面上で確認）。`,'ok');
@@ -1174,6 +1195,7 @@
     const oldRecord=snapshotRecord(q);
     const previousAutomatic=lastAutomatic?.q===q?cloneData(lastAutomatic):null;
     const answerBefore=cloneData(answerContext);
+    const progressBefore=cloneData(progressNotice);
     const lastCreditDay=getRecord(q)?.lastCreditDay||'';
     const token=++operationNonce;
     pending=null;
@@ -1183,8 +1205,9 @@
         return setInfo('△への画面反映を確認できなかったため、履歴を変更していない。','warn');
       if(storeRecord(q,'△',0,'自信なし',{lastCreditDay,legacyStreak:0})) {
         lastAutomatic={kind:'unsure',q,beforeQB:current,afterQB:'△',oldRecord,
-          newRecord:snapshotRecord(q),token,previousAutomatic,answerBefore};
+          newRecord:snapshotRecord(q),token,previousAutomatic,answerBefore,progressBefore};
         answerContext={...answerBefore,unsure:true};
+        progressNotice={q,text:'自信なし：△にし、正解日のカウントを0に戻した。取り消しで元に戻せる。'};
         setReason('正解したが自信なしと判断。△にし、連続正解回数を0にした。取り消すと直前の状態に戻す。');
         setInfo('自信なしを適用した。右の「自信なしを取り消す」で元の評価・回数へ戻せる。','ok');
         refreshSmartInfo();
@@ -1229,19 +1252,60 @@
         history=oldHistory||Object.create(null);
         return;
       }
-      ++operationNonce;pending=null;lastAutomatic=null;answerContext=null;
+      ++operationNonce;pending=null;lastAutomatic=null;answerContext=null;lastDecision=null;progressNotice=null;
       refreshSmartInfo();
       setInfo(`履歴${changed}件を読み込んだ（旧版の回数は昇格に使わない）。`,'ok');
     } catch(e) {setInfo(`読み込みに失敗：${String(e.message||e)}`,'error');}
   }
 
-  function setInfo(message, type='neutral') {
+  function assistStatus(kind,label='') {
+    const states={
+      'reading-result':{title:'正誤を読み込み中',message:'解答結果の表示を待っている。自動で確認を続ける。'},
+      'reading-previous':{title:'前回評価を読み込み中',message:'解答履歴の表示を待っている。まだ登録操作は不要。'},
+      'missing-previous':{title:'停止：前回評価が不明',message:'QB評価は変更していない。まず判定の詳細を確認。前回評価の手動登録は確実に分かる場合だけ。',action:'details',actionLabel:'判定の詳細を開く',type:'warn'},
+      'missing-result':{title:'停止：今回の正誤が不明',message:'QB評価は変更していない。QBの解答結果を確認し、この問題は通常の評価操作を使う。',action:'details',actionLabel:'判定の詳細を開く',type:'warn'},
+      'inconsistent-result':{title:'停止：画面の確認が未完了',message:'取得した情報と現在の画面を照合できず、QB評価は変更していない。判定の詳細とQB画面を確認。',action:'details',actionLabel:'判定の詳細を開く',type:'warn'},
+      'missing-button':{title:`停止：${label}ボタンが未認識`,message:'判定はできたが、評価は変更していない。未知のアイコンは一度登録すると再利用できる。',action:'calibrate',actionLabel:`${label}ボタンの登録設定を開く`,label,type:'warn'},
+      'unconfirmed':{title:'要確認：評価の反映が未確認',message:`${label}への操作後、画面反映を確認できなかった。追加クリックはせず、QBの現在評価を確認。`,action:'details',actionLabel:'判定の詳細を開く',type:'warn'},
+      'storage-unavailable':{title:'停止：履歴を保存できない',message:'QB評価は変更していない。ブラウザの保存設定・空き容量を確認。',type:'error'}
+    };
+    return states[kind];
+  }
+  function setAssistStatus(kind,label='') {
+    const state=assistStatus(kind,label);
+    if(!state)return;
+    setInfo(state.message,state.type||'neutral',state);
+  }
+  function openAssistTarget(action,label='') {
+    if(!ui)return;
+    const sh=ui.shadow;
+    config.collapsed=false;
+    refreshUI();applyPanelGeometry();save();
+    const details=sh.getElementById(action==='calibrate'?'otherSettings':'reasonDetails');
+    if(action==='calibrate') {
+      sh.getElementById('settingsDetails').open=true;
+      if(['◎','○','△','×'].includes(label))sh.getElementById('calibrateLabel').value=label;
+    }
+    details.open=true;
+    details.querySelector('summary').focus();
+    details.scrollIntoView({block:'nearest'});
+    // 案内ボタンは設定を開くだけ。登録開始・再判定・QB操作は行わない。
+  }
+  function setInfo(message, type='neutral', state=null) {
     if (!ui) return;
     const info = ui.shadow.getElementById('status');
     if (!info) return;
-    info.textContent = message;
+    const title=state?.title || (type==='ok'?'完了':type==='warn'?'確認が必要':type==='error'?'処理を停止':'待機・操作案内');
+    const titleNode=ui.shadow.getElementById('statusTitle'), messageNode=ui.shadow.getElementById('statusMessage');
+    if(titleNode.textContent!==title)titleNode.textContent=title;
+    if(messageNode.textContent!==message)messageNode.textContent=message;
+    const action=ui.shadow.getElementById('statusAction');
+    action.hidden=!state?.action;
+    if(action.textContent!==(state?.actionLabel||''))action.textContent=state?.actionLabel||'';
+    action.dataset.action=state?.action||'';
+    action.dataset.label=state?.label||'';
     info.dataset.type = type;
-    info.title = message; // 省略表示された通常メッセージはホバーで全文を確認できる。
+    info.title = message;
   }
   function refreshUI() {
     if (!ui) return;
@@ -1253,6 +1317,7 @@
     const smart=config.mode==='smart';
     sh.getElementById('fixedSettings').hidden=smart || config.mode==='off';
     sh.getElementById('smartSettings').hidden=!smart;
+    sh.getElementById('historyDetails').hidden=!smart;
     sh.getElementById('hint').hidden = smart || config.mode==='off';
     sh.getElementById('hint').textContent=smart
       ? '△は異なる学習日の正解3回で○。同日1回のみ加算、◎は維持。判定できない場合は何もしない。'
@@ -1362,10 +1427,10 @@
         :host {all:initial;color-scheme:light;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif}
         * {box-sizing:border-box}
         [hidden] {display:none!important}
-        #panel {position:relative;display:flex;flex-direction:column;width:304px;min-width:250px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 8px 26px rgba(15,23,42,.16);overflow:visible}
+        #panel {position:relative;display:flex;flex-direction:column;width:280px;min-width:250px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 8px 26px rgba(15,23,42,.16);overflow:visible}
         #top {display:flex;align-items:center;gap:8px;padding:10px 12px;background:#111827;border-bottom:1px solid #1e40af;border-radius:11px 11px 0 0;color:#fff;cursor:grab;touch-action:none;user-select:none}
         #top:active {cursor:grabbing}
-        #title {flex:1;font-weight:750;font-size:13px;letter-spacing:.01em;color:#fff}
+        #title {flex:1;min-width:0;font-weight:750;font-size:13px;letter-spacing:.01em;color:#fff}
         #modeName {padding:3px 7px;border-radius:6px;background:#334155;color:#fff;font-weight:700;font-size:11px;white-space:nowrap}
         #modeName[data-mode="smart"] {background:#bfdbfe;color:#1e3a8a}
         #modeName[data-mode="triangle"],#modeName[data-mode="wrong"] {background:#eef2ff;color:#3730a3}
@@ -1375,12 +1440,12 @@
         button:focus-visible,select:focus-visible,summary:focus-visible {outline:2px solid #2563eb;outline-offset:2px}
         button:disabled {opacity:.45;cursor:not-allowed}
         #toggle {font-size:11px;padding:3px 7px;font-weight:600;background:#334155;color:#fff;border-color:#64748b}
-        #main {flex:1;min-height:0;padding:12px;max-height:calc(100vh - 82px);overflow:auto;border-radius:0 0 12px 12px}
+        #main {flex:1;min-height:0;padding:10px;max-height:calc(100vh - 82px);overflow:auto;border-radius:0 0 12px 12px}
         label {display:block;font-size:12px;font-weight:700;color:#334155;margin:0 0 5px}
         select {width:100%;height:36px;padding:5px 9px;border:1px solid #94a3b8;border-radius:8px;color:#0f172a;background:#fff}
         #hint {font-size:11px;color:#854d0e;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;padding:7px 9px;margin-top:10px}
-        #smartSettings {margin-top:12px}
-        #smartCard {display:flex;gap:12px;align-items:center;padding:12px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc}
+        #smartSettings {margin-top:0}
+        #smartCard {display:flex;gap:10px;align-items:center;padding:9px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc}
         .scoreBlock {min-width:75px}
         .caption {font-size:11px;font-weight:600;color:#475569}
         #smartLabel {font-weight:760;font-size:28px;line-height:1.2;color:#1d4ed8;display:block;margin:3px 0 0}
@@ -1400,7 +1465,12 @@
         #status[data-type="ok"] {background:#f0fdf4;color:#166534}
         #status[data-type="warn"] {background:#fffbeb;color:#92400e;border:1px solid #fcd34d}
         #status[data-type="error"] {background:#fef2f2;color:#991b1b;border:1px solid #fecaca}
-        #status:not([data-type="warn"]):not([data-type="error"]) {display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+        #statusTitle {display:block;font-size:12px;margin-bottom:3px}
+        #statusAction {margin-top:7px;font-size:11px;width:100%}
+        #progressNote {margin:7px 0 0;font-size:11px;color:#334155;line-height:1.5}
+        #settingsDetails>summary {border-top:1px solid #e2e8f0;padding-top:9px}
+        #modeName {cursor:pointer}
+        #smartActions button {min-height:36px}
         details {margin-top:10px}
         summary {color:#475569;font-size:12px;font-weight:650;cursor:pointer;padding:4px 0;user-select:none}
         summary:hover {color:#1d4ed8}
@@ -1436,33 +1506,37 @@
         <span class="resize-handle resize-nw" data-resize="nw" aria-hidden="true"></span>
         <span class="resize-handle resize-se" data-resize="se" aria-hidden="true"></span>
         <span class="resize-handle resize-sw" data-resize="sw" aria-hidden="true"></span>
-        <div id="top" title="ドラッグして移動"><span id="title">QB 復習アシスト</span><span id="modeName">OFF</span><button id="toggle" type="button" aria-expanded="true">閉じる</button></div>
+        <div id="top" title="ドラッグして移動"><span id="title">QB 復習アシスト</span><button id="modeName" type="button" aria-label="動作モードの設定を開く">OFF</button><button id="toggle" type="button" aria-expanded="true">閉じる</button></div>
         <div id="main">
+          <div id="smartSettings" hidden>
+            <div id="smartCard" aria-label="現在の評価と昇格までの正解日数">
+              <div class="scoreBlock"><span class="caption">現在の評価</span><strong id="smartLabel">—</strong></div>
+              <div class="scoreRight"><span class="caption">○までの正解日</span><strong id="smartStreak">—</strong><div class="track" aria-hidden="true"><span id="progressFill"></span></div></div>
+            </div>
+            <p id="progressNote"></p>
+            <div id="smartActions"><button id="unsure" type="button" disabled>自信なし</button><button id="undo" type="button" disabled>取り消す</button></div>
+            <details id="reasonDetails"><summary>判定の詳細</summary><div class="detailsContent"><div id="smartNow"></div><div id="smartReason" role="status"></div><p class="small">異なる3学習日の連続正解で△→○。加算は日本時間で1日1回。不正解・自信なしで0に戻る。学習しない日を挟んでも維持し、◎へは自動昇格しない。</p></div></details>
+
+          </div>
+          <div id="status" role="status" aria-live="polite"><strong id="statusTitle">待機中</strong><div id="statusMessage">上のモード表示から設定を開ける。</div><button id="statusAction" type="button" hidden></button></div>
+          <details id="settingsDetails"><summary>設定・履歴</summary><div class="detailsContent">
           <label for="mode">動作モード</label>
           <select id="mode"><option value="off">OFF（QBの通常動作）</option><option value="smart">自動判定（おすすめ）</option><option value="triangle">△を固定</option><option value="wrong">×を固定</option></select>
           <div id="hint" hidden></div>
-          <div id="smartSettings" hidden>
-            <div id="smartCard" aria-label="現在の評価と連続正解回数">
-              <div class="scoreBlock"><span class="caption">現在の評価</span><strong id="smartLabel">—</strong></div>
-              <div class="scoreRight"><span class="caption">連続正解</span><strong id="smartStreak">—</strong><div class="track" aria-hidden="true"><span id="progressFill"></span></div></div>
-            </div>
-            <div id="smartActions"><button id="unsure" type="button" disabled>自信なし</button><button id="undo" type="button" disabled>取り消す</button></div>
-            <details id="reasonDetails"><summary>判定の詳細</summary><div class="detailsContent"><div id="smartNow"></div><div id="smartReason" role="status"></div></div></details>
             <details id="historyDetails"><summary>履歴と前回評価の修正</summary><div class="detailsContent">
               <div class="small">前回の評価が確実にわかる場合だけ手動登録する。</div>
               <div class="compact"><select id="setPrevious" aria-label="前回評価"><option value="">前回評価を選択</option><option value="◎">◎</option><option value="○">○</option><option value="△">△</option><option value="×">×</option><option value="未演習">未演習</option></select><button id="savePrevious" type="button">登録</button></div>
               <div class="compact"><button id="exportHistory" type="button">履歴を保存</button><button id="importHistory" type="button">履歴を読込</button><input id="historyFile" type="file" accept=".json,application/json" hidden /></div>
               <p class="small">QBの評価はQB側で同期される。連続正解回数・正解日はブラウザごとに保存される。</p>
             </div></details>
-          </div>
           <div id="fixedSettings" hidden>
             <div id="learned"></div>
             <details id="fixedTools"><summary>固定モードの設定</summary><div class="detailsContent"><div id="buttons"><button id="train" type="button">ボタン位置を登録</button><button id="apply" type="button">今回の評価に適用</button><button id="forget" type="button">登録解除</button></div></div></details>
           </div>
-          <div id="status" role="status" aria-live="polite">待機中</div>
           <details id="otherSettings"><summary>その他の設定</summary><div class="detailsContent"><div class="small">通常は自動認識する。未知のアイコンだけ、最初の1回登録すれば他の問題にも適用する。</div>
             <div class="compact"><select id="calibrateLabel" aria-label="登録する評価"><option value="△">△ボタン</option><option value="×">×ボタン</option><option value="○">○ボタン</option><option value="◎">◎ボタン</option></select><button id="calibrate" type="button">評価ボタンを登録</button></div>
             <button id="resetPosition" type="button">表示位置を右上に戻す</button><p class="small">パネルの四隅や辺をドラッグすると、大きさを変更して保存できる。</p><div id="foot">初回は評価を変更した後にQBを再読み込みし、保存を確認する。表示上の反映とサーバーへの保存は別である。</div></div></details>
+          </div></details>
         </div>
       </section>`;
     document.body.append(host);
@@ -1505,6 +1579,17 @@
     };
     bar.addEventListener('pointerup', stopDrag);
     bar.addEventListener('pointercancel', stopDrag);
+    sh.getElementById('settingsDetails').open=config.mode==='off';
+    sh.getElementById('modeName').addEventListener('click',()=>{
+      config.collapsed=false;save();refreshUI();applyPanelGeometry();
+      sh.getElementById('settingsDetails').open=true;
+      sh.getElementById('mode').focus();
+      sh.getElementById('mode').scrollIntoView({block:'nearest'});
+    });
+    sh.getElementById('statusAction').addEventListener('click',()=>{
+      const button=sh.getElementById('statusAction');
+      openAssistTarget(button.dataset.action,button.dataset.label);
+    });
     sh.getElementById('calibrate').addEventListener('click',()=>{
       if(!hasResultUI())return setInfo('解答後に「評価ボタンを登録」を押すこと。','warn');
       const requested=sh.getElementById('calibrateLabel').value;
@@ -1525,7 +1610,7 @@
       config.mode = e.target.value;
       learning = false;learningTarget=null;
       pending = null;
-      ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;
+      ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;progressNotice=null;
       save(); refreshUI();
       if(config.mode==='smart' && !hasResultUI())startPreviousLookup(questionId());
       setInfo(config.mode === 'off'
@@ -1565,7 +1650,7 @@
       if(config.mode!=='smart')return;
       const value=sh.getElementById('setPrevious').value;
       if(!value)return setInfo('前回評価を選んでから登録すること。','warn');
-      ++operationNonce;pending=null;answerContext=null;lastAutomatic=null;
+      ++operationNonce;pending=null;answerContext=null;lastAutomatic=null;progressNotice=null;
       if(storeRecord(questionId(),value,0,'手動登録',{legacyStreak:0}))setInfo(`この問題の前回評価を${value}に登録（連続回数0）。`,'ok');
     });
     sh.getElementById('exportHistory').addEventListener('click',exportSmartHistory);
@@ -1610,12 +1695,15 @@
       const taskBeforeIsUnknown=!pending.before?.label;
       const mode=pending.mode, sym = LABELS[mode];
       const q=pending.q;
+      const outcome=mode==='smart'?resolveCurrentCorrectness(q):null;
       const details=mode==='smart' ?
-        `前回評価:${taskBeforeIsUnknown?'不明':pending.before.label} ／ 今回正誤:${resolveCurrentCorrectness(q)?'検出済み':'不明'}`:'';
+        `前回評価:${taskBeforeIsUnknown?'不明':pending.before.label} ／ 今回正誤:${outcome?'検出済み':'不明'}`:'';
       pending = null;
-      setInfo(mode==='smart'
-        ? `自動処理を停止（${details}）。QBの評価は変更していない。`
-        : `${sym}を自動検出できなかった。解答後に「ボタン位置を登録」を使う。QBの評価はそのまま。`, 'warn');
+      if(mode==='smart') {
+        setReason(`自動処理を停止：${details}。QB評価は変更していない。`);
+        setAssistStatus(!outcome?'missing-result':taskBeforeIsUnknown?'missing-previous':'inconsistent-result');
+      } else setAssistStatus('missing-button',sym);
+      refreshSmartInfo();
     }
   }
 
@@ -1653,7 +1741,7 @@
       const manual=scoreSymbolOf(target);
       if(['◎','○','△','×'].includes(manual)) {
         const q=questionId(), lastCreditDay=getRecord(q)?.lastCreditDay||'';
-        ++operationNonce;pending=null;answerContext=null;lastAutomatic=null;
+        ++operationNonce;pending=null;answerContext=null;lastAutomatic=null;progressNotice=null;
         setInfo(`${manual}への手動変更を画面で確認中。`);
         window.setTimeout(()=>{
           if(q!==questionId())return;
@@ -1688,12 +1776,11 @@
         }
         answerSnapshots.delete(q);postAnswerDom.delete(q);pageWasAnswerable=false;
       }
-      ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;
+      ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;progressNotice=null;
       pending={q:questionId(),mode:config.mode,before,
         until:Date.now()+MAX_WAIT,done:false,manual:false,token:operationNonce};
-      setInfo(config.mode==='smart'
-        ? `前回${before.label||'不明'}。今回の正誤確定を待っている。`
-        : `${LABELS[config.mode]}固定：解答結果の表示を検知待ち。`);
+      if(config.mode==='smart')setAssistStatus('reading-result');
+      else setInfo(`${LABELS[config.mode]}固定：解答結果の表示を検知待ち。`);
       queueScan();
     }
   }
@@ -1713,7 +1800,7 @@
     window.addEventListener('storage',e=>{
       if(e.key!==SMART_HISTORY_KEY)return;
       history=readSmartHistory();
-      ++operationNonce;pending=null;lastAutomatic=null;answerContext=null;lastDecision=null;
+      ++operationNonce;pending=null;lastAutomatic=null;answerContext=null;lastDecision=null;progressNotice=null;
       refreshSmartInfo();
       setInfo('別のタブで履歴が更新されたため、待機中の自動操作を停止した。','warn');
     });
@@ -1729,7 +1816,7 @@
         reactReadCache={q:null,at:0,item:null};
         pending = null;
         learning = false;learningTarget=null;
-        ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;
+        ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;progressNotice=null;
         setInfo(config.mode === 'off'
           ? 'OFF。通常のQB動作。'
           : config.mode==='smart'? '自動判定モード。判定不能な場合はQBの評価を変更しない。'
