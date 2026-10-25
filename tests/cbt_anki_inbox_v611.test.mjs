@@ -19,6 +19,7 @@ function setup(){
   ensureActiveExerciseSession:()=>({id:'s'}),
   getExerciseState:()=>structuredClone(state),
   saveExerciseState:value=>{state=structuredClone(value);sim.writes++},
+  getDraftReason:()=>'',consumeReasonAfterOverride(){},
   getSettings:()=>({}),location:{href:'https://example.invalid/quiz'},
   updateUI(){},toast:message=>sim.messages.push(message),Date
  });

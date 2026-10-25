@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.11
-// @description  CBT Medilink専用。○・◎でもカード化するボタンを常時表示。移動・サイズ調整、演習別保存、科目の自動判定に対応。
+// @version      6.12
+// @description  CBT Medilink専用。理由をワンタップで記録し、今の問題の候補をその場で編集・取り消し。演習別保存・科目の自動判定に対応。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @match        https://cbt.medilink-study.com/*
@@ -36,6 +36,10 @@
   let host = null;
   let shadow = null;
   let stagedImages = [];
+  const CAPTURE_REASONS = ["勘で正解", "知識不足", "鑑別で迷った", "画像を覚えたい"];
+  let stagedReason = "";
+  let questionEditor = null;
+  let questionListSignature = "";
   let lastSelectedText = "";
   let hoveredImage = null;
   let toastTimer = null;
@@ -601,13 +605,15 @@
           session.chapterCode || null,
         addedAt: new Date().toISOString(),
         forceAutomaticRegardlessOfLatestRating: true,
-        reason: "user_explicit_opt_in"
+        reason: "user_explicit_opt_in",
+        captureReason: getDraftReason()
       };
     } else {
       delete session.automaticOverrides[qbId];
     }
 
     saveExerciseState(state);
+    if (enabled) consumeReasonAfterOverride();
     updateUI();
 
     toast(
@@ -1419,12 +1425,12 @@
   // =========================================================
 
   function hasUnsavedDraft() {
-    if (!shadow) return stagedImages.length > 0;
+    if (!shadow) return stagedImages.length > 0 || Boolean(stagedReason);
 
     const textarea = shadow.getElementById("memory-text");
     const raw = textarea ? textarea.value.trim() : "";
 
-    return Boolean(raw || stagedImages.length > 0);
+    return Boolean(raw || stagedImages.length > 0 || getDraftReason());
   }
 
   function saveDraftAsCandidates(options = {}) {
@@ -1456,8 +1462,9 @@
 
     const textarea = shadow.getElementById("memory-text");
     const raw = textarea.value.trim();
+    const captureReason = getDraftReason();
 
-    if (!raw && stagedImages.length === 0) {
+    if (!raw && stagedImages.length === 0 && !captureReason) {
       if (!silentWhenEmpty) {
         toast("覚えたい内容または画像を追加してください");
       }
@@ -1474,8 +1481,8 @@
       .map((line) => line.trim())
       .filter(Boolean);
 
-    if (lines.length === 0 && stagedImages.length > 0) {
-      lines = [""];
+    if (lines.length === 0 && (stagedImages.length > 0 || captureReason)) {
+      lines = [captureReason ? `追加理由：${captureReason}` : ""];
     }
 
     const question = getCurrentQuestionInfo();
@@ -1511,6 +1518,7 @@
         captureId,
         ankiId,
         rawText: line,
+        captureReason,
         images: JSON.parse(JSON.stringify(stagedImages)),
 
         // オプトイン方式：
@@ -1559,6 +1567,7 @@
     }
 
     stagedImages = [];
+    clearDraftReason();
     renderImagePreviews();
     updateQuestionDisplay();
 
@@ -1631,6 +1640,7 @@
 
     if (!ok) return;
 
+    if (questionEditor?.captureId === captureId) { questionEditor=null; questionListSignature=""; }
     saveItems(
       items.filter((item) => item?.captureId !== captureId)
     );
@@ -2615,6 +2625,18 @@
     margin-bottom: 0;
   }
 
+  #capture-reasons { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:5px; }
+  #capture-reasons button { width:auto; padding:5px 8px; margin:0; font-size:11px; background:#edf8ff; color:#075b8b; border:1px solid #91b9d2; border-radius:7px; }
+  #capture-reasons button[aria-pressed="true"] { background:#0756d8; color:#fff; border-color:#0756d8; }
+  #question-candidates { margin:8px 0; border:1px solid #c4dfef; border-radius:8px; padding:7px; }
+  #question-candidates > summary { cursor:pointer; color:#075b8b; font-size:12px; font-weight:700; }
+  .question-editor { padding:8px 0; }
+  .question-editor textarea { width:100%; min-height:75px; }
+  .question-editor img { display:block; max-width:100%; max-height:90px; object-fit:contain; }
+  .question-editor label { font-size:11px; }
+  .question-editor input[type="checkbox"] { width:auto; }
+  .candidate-edit { flex:0 0 auto; width:auto; margin:0; padding:4px 7px; border:1px solid #91b9d2; border-radius:7px; background:#edf8ff; color:#075b8b; font-size:10px; cursor:pointer; }
+
   .force-auto-button {
     margin-top: 8px;
     border: 1px solid #c4b5fd;
@@ -2924,6 +2946,14 @@
     </div>
   </div>
 
+  <label>追加する理由（任意）</label>
+  <div id="capture-reasons" role="group" aria-label="追加する理由"></div>
+  <div class="memory-note">理由だけでも候補に追加できます。</div>
+  <details id="question-candidates">
+    <summary id="question-candidates-summary">この問題：追加済み0件</summary>
+    <div id="question-candidates-list"></div>
+  </details>
+
   <label>覚えたいこと</label>
   <textarea
     id="memory-text"
@@ -3059,6 +3089,8 @@
   // =========================================================
 
   function bindUI() {
+    questionListSignature = "";
+    renderReasonButtons();
     shadow.getElementById("main-button").addEventListener("click", () => {
       shadow.getElementById("panel").classList.toggle("open");
       updateQuestionDisplay();
@@ -3973,7 +4005,140 @@
   // 演習・候補一覧表示
   // =========================================================
 
-  function buildCandidateCard(item) {
+  function getDraftReason() {
+    return CAPTURE_REASONS.includes(stagedReason) ? stagedReason : "";
+  }
+
+  function clearDraftReason() {
+    stagedReason = "";
+    renderReasonButtons();
+  }
+
+  function consumeReasonAfterOverride() {
+    if (!shadow?.getElementById("memory-text")?.value.trim() && stagedImages.length === 0) clearDraftReason();
+  }
+
+  function renderReasonButtons() {
+    const area = shadow?.getElementById("capture-reasons");
+    if (!area) return;
+    if (!area.children.length) {
+      for (const reason of CAPTURE_REASONS) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = reason;
+        button.dataset.reason = reason;
+        button.addEventListener("click", () => {
+          stagedReason = stagedReason === reason ? "" : reason;
+          renderReasonButtons();
+        });
+        area.append(button);
+      }
+    }
+    for (const button of area.children) button.setAttribute("aria-pressed", String(button.dataset.reason === getDraftReason()));
+  }
+
+  function currentQuestionContext() {
+    const question = getCurrentQuestionInfo();
+    const session = getActiveExerciseSession();
+    return isQBQuizPage() && question.qbId && session?.id
+      ? {qbId:String(question.qbId), sessionId:session.id} : null;
+  }
+
+  function candidateInContext(item, context) {
+    return Boolean(context && item?.exerciseSessionId === context.sessionId && String(item?.sourceProblem?.qbId || "") === context.qbId);
+  }
+
+  function commitQuestionEdit(snapshot, rawText, captureReason, keepImages) {
+    const items = getItems();
+    const index = items.findIndex(item => item.captureId === snapshot.captureId);
+    const current = items[index];
+    if (!candidateInContext(current, currentQuestionContext()) || JSON.stringify(current) !== JSON.stringify(snapshot)) {
+      toast("候補または問題が変わったため保存していません。編集を閉じて開き直してください");
+      return false;
+    }
+    const reason = CAPTURE_REASONS.includes(captureReason) ? captureReason : "";
+    const images = (current.images || []).filter((_, i) => keepImages.includes(i));
+    let text = String(rawText || "").trim();
+    if (current.captureReason && text === `追加理由：${current.captureReason}`) text = reason ? `追加理由：${reason}` : "";
+    if (!text && !reason && !images.length) {
+      toast("本文・理由・画像のいずれかを残してください。取り消す場合は候補の削除を使えます");
+      return false;
+    }
+    const updated = {...current, rawText:text || (reason ? `追加理由：${reason}` : ""), captureReason:reason, images};
+    if (updated.rawText === current.rawText && reason === (current.captureReason || "") && images.length === (current.images || []).length) {
+      questionEditor = null; questionListSignature = ""; renderQuestionCandidates();
+      return true;
+    }
+    updated.updatedAt = new Date().toISOString();
+    // 同じIDの候補を編集。書き出し済みファイルやAnkiのカードは直接変更しない。
+    for (const key of ["exportedAt", "exportMethod", "exportBatchId", "exportFilename"]) delete updated[key];
+    items[index] = updated;
+    try { GM_setValue(ITEMS_KEY, items); }
+    catch (_) { toast("保存できませんでした。編集内容はこの画面に残しています"); return false; }
+    questionEditor = null; questionListSignature = "";
+    updateUI();
+    toast(current.exportedAt ? "編集を保存しました。変更を反映するには再書き出しが必要です" : "編集を保存しました");
+    return true;
+  }
+
+  function openQuestionEditor(item, card) {
+    if (!candidateInContext(item, currentQuestionContext())) return;
+    if (questionEditor) { toast("先に開いている編集を保存するか、キャンセルしてください"); return; }
+    const snapshot = JSON.parse(JSON.stringify(item));
+    questionEditor = {captureId:item.captureId, context:currentQuestionContext()};
+    const editor = document.createElement("div");
+    editor.className = "question-editor";
+    const input = document.createElement("textarea");
+    input.value = item.rawText || "";
+    input.setAttribute("aria-label", "候補の本文");
+    const reason = document.createElement("select");
+    reason.setAttribute("aria-label", "候補を追加した理由");
+    for (const value of ["", ...CAPTURE_REASONS]) {
+      const option = document.createElement("option");
+      option.value = value; option.textContent = value || "理由なし"; reason.append(option);
+    }
+    reason.value = item.captureReason || "";
+    editor.append(input, reason);
+    const checks = [];
+    for (const [i, image] of (item.images || []).entries()) {
+      const label = document.createElement("label");
+      const check = document.createElement("input"); check.type = "checkbox"; check.checked = true;
+      const preview = document.createElement("img"); preview.src = image.dataUrl || image.src || ""; preview.alt = `画像${i+1}`;
+      label.append(check, document.createTextNode(`画像${i+1}を残す`), preview);
+      editor.append(label); checks.push(check);
+    }
+    const save = document.createElement("button"); save.type = "button"; save.textContent = "編集を保存";
+    save.addEventListener("click", () => commitQuestionEdit(snapshot, input.value, reason.value, checks.flatMap((check,i) => check.checked ? [i] : [])));
+    const cancel = document.createElement("button"); cancel.type = "button"; cancel.textContent = "キャンセル";
+    cancel.addEventListener("click", () => { questionEditor=null; questionListSignature=""; renderQuestionCandidates(); });
+    editor.append(save, cancel); card.append(editor); input.focus();
+  }
+
+  function renderQuestionCandidates() {
+    const list = shadow?.getElementById("question-candidates-list");
+    const summary = shadow?.getElementById("question-candidates-summary");
+    if (!list || !summary) return;
+    const context = currentQuestionContext();
+    const items = getItems().filter(item => candidateInContext(item, context));
+    const override = context ? getAutomaticOverridesForSession(context.sessionId).find(entry => String(entry.qbId) === context.qbId) : null;
+    summary.textContent = context ? `この問題：追加済み${items.length}件${override ? " ＋ 自動カード指定" : ""}` : "この問題：QBの問題画面で確認できます";
+    if (questionEditor && JSON.stringify(questionEditor.context) !== JSON.stringify(context)) {
+      questionEditor = null; questionListSignature = "";
+      toast("問題が変わったため編集を閉じました。保存前の変更は反映していません");
+    }
+    // 自動再描画で入力中の本文を消さない。保存時には元の候補との一致を再確認する。
+    if (questionEditor) return;
+    const signature = JSON.stringify([context, items, override]);
+    if (signature === questionListSignature) return;
+    questionListSignature = signature; list.innerHTML = "";
+    if (!items.length && !override) {
+      const empty = document.createElement("div"); empty.className="candidate-empty"; empty.textContent="この問題の候補はまだありません。"; list.append(empty);
+    }
+    for (const item of items) list.append(buildCandidateCard(item, true));
+    if (override) list.append(buildAutomaticOverrideCard(override, context.sessionId, true));
+  }
+
+  function buildCandidateCard(item, editable = false) {
     const card = document.createElement("div");
     card.className = "candidate-card";
 
@@ -4012,6 +4177,10 @@
         ? "手動＋自動"
         : "手動のみ";
     badges.appendChild(policy);
+    if (item?.captureReason) {
+      const reason = document.createElement("span"); reason.className="candidate-badge";
+      reason.textContent=item.captureReason; badges.append(reason);
+    }
 
     if ((item?.images || []).length > 0) {
       const imageBadge = document.createElement("span");
@@ -4039,7 +4208,7 @@
     const deleteButton = document.createElement("button");
     deleteButton.className = "candidate-delete";
     deleteButton.type = "button";
-    deleteButton.textContent = "削除";
+    deleteButton.textContent = editable ? "取り消す" : "削除";
     deleteButton.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -4047,13 +4216,30 @@
     });
 
     top.appendChild(main);
+    if (editable) {
+      const edit = document.createElement("button"); edit.type="button"; edit.className="candidate-edit"; edit.textContent="編集";
+      edit.addEventListener("click", () => openQuestionEditor(item, card)); top.append(edit);
+    }
     top.appendChild(deleteButton);
     card.appendChild(top);
 
     return card;
   }
 
-  function buildAutomaticOverrideCard(entry, sessionId) {
+  function updateOverrideReason(snapshot, sessionId, reason) {
+    const context = currentQuestionContext();
+    const state = getExerciseState();
+    const current = state.sessions?.[sessionId]?.automaticOverrides?.[String(snapshot.qbId)];
+    if (!context || context.sessionId !== sessionId || context.qbId !== String(snapshot.qbId) || JSON.stringify(current) !== JSON.stringify(snapshot)) {
+      toast("問題または指定が変わったため保存していません"); return false;
+    }
+    current.captureReason = CAPTURE_REASONS.includes(reason) ? reason : "";
+    try { saveExerciseState(state); }
+    catch (_) { toast("理由を保存できませんでした"); return false; }
+    updateUI(); toast("理由を更新しました。次の書き出しに反映されます"); return true;
+  }
+
+  function buildAutomaticOverrideCard(entry, sessionId, editable = false) {
     const card = document.createElement("div");
     card.className = "candidate-card";
 
@@ -4085,10 +4271,23 @@
     badge.className = "candidate-badge exported";
     badge.textContent = "○・◎でも自動";
     badges.appendChild(badge);
+    if (entry?.captureReason) {
+      const reason = document.createElement("span"); reason.className="candidate-badge";
+      reason.textContent=entry.captureReason; badges.append(reason);
+    }
 
     main.appendChild(title);
     main.appendChild(meta);
     main.appendChild(badges);
+    if (editable) {
+      const reason = document.createElement("select"); reason.setAttribute("aria-label", "自動カード指定の理由を変更");
+      for (const value of ["", ...CAPTURE_REASONS]) {
+        const option = document.createElement("option"); option.value=value; option.textContent=value || "理由なし"; reason.append(option);
+      }
+      reason.value=entry.captureReason || "";
+      reason.addEventListener("change", () => { if (!updateOverrideReason(entry, sessionId, reason.value)) reason.value=entry.captureReason || ""; });
+      main.append(reason);
+    }
 
     const remove = document.createElement("button");
     remove.type = "button";
@@ -4383,6 +4582,7 @@
     updateSettingsSummary();
     renderSaveDestination();
     renderExerciseSummary();
+    renderQuestionCandidates();
     renderCurrentCandidateList();
     renderAutomaticOverrideButton();
     renderCurrentAutomaticOverrideList();
@@ -4444,6 +4644,7 @@
     updateQuestionDisplay();
     renderSaveDestination();
     renderExerciseSummary();
+    renderQuestionCandidates();
     renderCurrentCandidateList();
     renderAutomaticOverrideButton();
     renderCurrentAutomaticOverrideList();
@@ -4654,6 +4855,7 @@
       lastUrl = location.href;
 
       stagedImages = [];
+      clearDraftReason();
       lastSelectedText = "";
       hoveredImage = null;
 
@@ -4716,6 +4918,7 @@
     updateQuestionDisplay();
     renderSaveDestination();
     renderExerciseSummary();
+    renderQuestionCandidates();
   }
 
   // =========================================================
