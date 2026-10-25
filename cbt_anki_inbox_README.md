@@ -1,21 +1,35 @@
-# QB版 Anki追加箱 v6.14
+# QB版 Anki追加箱 v6.15
 
 [Tampermonkeyで更新](https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js)
 
-リンク先のバージョンが6.14であることを確認し、既存の「CBT Anki 追加箱」を更新してQBを再読み込みする。保存済みの候補・設定を削除する必要はない。既に開いている旧Exporterは必要な保存を済ませて手動で閉じ、更新後のQB画面から起動し直す。
+リンク先のバージョンが6.15であることを確認し、既存の「CBT Anki 追加箱」を更新してQBを再読み込みする。保存済みの候補・設定を削除する必要はない。既に開いている旧Exporterは必要な保存を済ませて手動で閉じ、更新後のQB画面から起動し直す。
 
-## v6.14：従来のダウンロード先・ファイル名へ戻す
+## v6.15：保存先・名前を維持して、成功後にExporterを閉じる
 
-- v6.13で追加した保存先選択を撤去。取得終了後はv6.12と同じ通常ダウンロードを開始する。保存先は従来どおりブラウザの既定ダウンロード先（通常はダウンロードフォルダ）。ブラウザ自身の保存確認設定は変更しない。
-- ファイル名は元の `qb_<取得問数>questions_with_answers_manual_<手動候補数>.json`。例：22問・手動候補4件なら `qb_22questions_with_answers_manual_4.json`。`qb_export.json`には変更しない。
-- 通常ダウンロードには保存完了通知がないため、タイマーで自動終了しない。保存成功を確認した後に「保存できたので閉じる」を押せる。ダウンロード要求だけでは候補を保存済みと通知しない。
-- 失敗・中断・部分取得時も画面と再保存ボタンを残す。ダウンロード中の可能性があるBlob URLは解放しない。QB本体や別画面を閉じない保護は維持する。
-- 復習評価・カード指定・候補内容・取得処理は変更していない。
+- Anki追加箱の「QB取得ツール」から起動すると、対応環境では親userscriptの `GM_download` がJSONを保存し、成功完了通知の後に専用Exporterだけ閉じる。保存先選択や保存確認クリック、終了タイマーは追加しない。
+- 保存先はブラウザ既定のダウンロード先、ファイル名は従来の `qb_<取得問数>questions_with_answers_manual_<手動候補数>.json`。例：`qb_22questions_with_answers_manual_4.json`。同名ファイルは上書きせずブラウザが連番等を付ける。
+- 全件取得・保存成功・中断なし・手動画像の取得失敗なしの場合だけ閉じる。保存失敗・取消・タイムアウト・部分取得では画面と再保存ボタンを残す。QB本体や遷移後の別画面は閉じない。
+- 新規grantは `GM_download` のみ。既存の接続範囲・他の権限は拡張しない。`GM_info` で実行中の拡張名・バージョン・ダウンロードモードを読み、設定は自動変更しない。
 
-保存方法復元の12件＋既存22件のローカルテストと構文チェックに合格。実ブラウザの保存・表示・終了は未検証。
+### 最初の一度だけ必要な確認
+
+1. 上の更新リンクでv6.15に更新し、追加されるダウンロード権限の表示があれば確認する。
+2. Tampermonkeyのダッシュボード → 設定 → Downloads（ダウンロード）で Download Mode を Browser API にする必要がある。既に設定済みなら変更不要。項目が見えない場合は設定表示モードをAdvanced（詳細）にする。ブラウザからダウンロード権限の確認が出た場合は本人が許可する。
+3. JSONが許可されていないというエラーが出た場合だけ、同じDownloadsの「Whitelisted File Extensions」で `.json` を許可する。既存の許可項目を削除したり全拡張子を許可したりしない。
+4. QBを再読み込みし、旧Exporterを必要な保存後に閉じ、Anki追加箱の「QB取得ツール」から起動し直す。
+
+対応条件はTampermonkeyのBlob対応版（安定版5.4.0以降、5.4系開発版は5.4.6226以降）、Browser APIモード、GM_downloadが利用可能なこと。旧版・非対応拡張・native/disabledモード・単体のコピー実行では従来の通常ダウンロードを行い、自動では閉じない旨を表示する。完了を確認できない環境でタイマーによる自動終了は行わない。
+
+42件のローカルテストと構文チェックに合格。実ユーザー環境の拡張バージョン・設定・権限・保存および終了動作は未検証。ブラウザや組織のポリシー、他のダウンロード管理機能がファイル名や保存先を変更する可能性はある。
+
+[GM_download公式仕様](https://www.tampermonkey.net/documentation.php?locale=en&q=GM_download) / [公式設定説明](https://www.tampermonkey.net/faq.php?locale=en&q=Q302)
 
 ```sh
-deno run --allow-read=. tests/cbt_anki_inbox_v613.test.mjs
+deno check cbt_anki_inbox.user.js
+deno run --allow-read=. tests/cbt_anki_inbox_v615_download.test.mjs
+deno run --allow-read=. tests/cbt_anki_inbox_v615_controller.test.mjs
+deno run --allow-read=. tests/cbt_anki_inbox_v611.test.mjs
+deno run --allow-read=. tests/cbt_anki_inbox_v612.test.mjs
 ```
 
 ## v6.12：理由を残す・今の問題の候補を編集する
