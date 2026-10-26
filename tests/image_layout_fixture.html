@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Anki追加箱・画像幅のローカル検証</title>
+<style>body{font:14px system-ui;margin:20px;background:#eef2f6}pre{white-space:pre-wrap}button,input{margin:6px}#results{max-width:650px}</style>
+<h1>画像幅の検証（合成画像のみ・外部通信なし）</h1>
+<p>同じフォルダの配布用 userscript を選び、検証を実行してください。QB・Anki・実際の保存データには接続しません。スマホ幅の確認ではブラウザの表示幅を320px程度に変更して再実行します。</p>
+<input id="source" type="file" accept=".js"><button id="run" disabled>幅とリサイズを検証</button>
+<pre id="results">未実行</pre><div id="fixture"></div>
+<script>
+let source='',disposePrevious=()=>{};
+const results=document.querySelector('#results');
+document.querySelector('#source').onchange=async event=>{
+  source=await event.target.files[0].text();
+  document.querySelector('#run').disabled=false;
+  results.textContent='ソース読込済み。検証はまだ実行していません。';
+};
+document.querySelector('#run').onclick=async()=>{
+  disposePrevious();
+  const logs=[];let cleanup=()=>{};
+  try {
+    const template=source.match(/shadow.innerHTML = `([\s\S]*?)`;/)[1];
+    const pinned=source.slice(source.indexOf('  function pinInboxActions()')).match(/style.textContent = `([\s\S]*?)`;/)[1];
+    const geometry=source.slice(source.indexOf('  function fitFloatingRect('),source.indexOf('  let disposeCompactSummary'));
+    const a=source.indexOf('  function renderImagePreviews('),b=source.indexOf('\n  function ',a+1),renderer=source.slice(a,b);
+    const host=document.createElement('div');document.querySelector('#fixture').replaceChildren(host);
+    const root=host.attachShadow({mode:'open'});root.innerHTML=template;
+    const panel=root.getElementById('panel'),content=root.getElementById('panel-content'),header=root.querySelector('.header');
+    const top=document.createElement('div');top.id='inbox-pinned-header';
+    top.append(header,root.querySelector('.count-row'),root.getElementById('run-qb-exporter'));
+    const bottom=document.createElement('div');bottom.id='inbox-pinned-footer';
+    bottom.append(root.getElementById('save-candidate'),root.getElementById('force-auto-current'),root.getElementById('force-auto-help'));
+    panel.insertBefore(top,content);panel.append(bottom);
+    const style=document.createElement('style');style.textContent=pinned;root.append(style);panel.classList.add('open');
+    const state=new Map();let staged=[];
+    const api=new Function('root','panel','header','state',`
+      const FLOAT_KEY='test-only'; let disposeFloatingPanel=null;
+      const GM_getValue=k=>state.get(k),GM_setValue=(k,v)=>state.set(k,v);
+      const shadow=root;let stagedImages=[];
+      ${geometry}\n${renderer}
+      return {install(width){state.set(FLOAT_KEY,{left:12,top:120,width,height:500});installFloatingPanel(root,panel,header)},
+        render(images){stagedImages=images;renderImagePreviews()},saved(){return state.get(FLOAT_KEY)},dispose(){disposeFloatingPanel?.()}};
+    `)(root,panel,header,state);
+    cleanup=()=>api.dispose();disposePrevious=cleanup;
+    const makeImage=(width,height)=>({width,height,dataUrl:'data:image/svg+xml,'+encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="#1976d2"/><text x="10" y="35" font-size="24" fill="white">${width} × ${height}</text></svg>`)});
+    const images=[makeImage(12000,300),makeImage(640,480),makeImage(300,4000)];
+    const original=JSON.stringify(images);
+    const assert=(ok,msg)=>{if(!ok)throw Error(msg)};
+    const settle=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    for(const width of [300,355,600]) {
+      api.install(width);api.render([]);await settle();const before=panel.getBoundingClientRect().width;
+      for(const image of images){
+        api.render([image]);await Promise.all([...root.querySelectorAll('.preview img')].map(img=>img.decode()));await settle();
+        assert(Math.abs(panel.getBoundingClientRect().width-before)<1,'画像追加でパネル幅が変わった');
+        assert(content.scrollWidth<=content.clientWidth+1,'画像で横スクロール幅が増えた');
+        const img=root.querySelector('.preview img'),box=img.parentElement;
+        assert(img.getBoundingClientRect().width<=box.getBoundingClientRect().width+1,'画像が枠を超えた');
+        assert(getComputedStyle(img).objectFit==='contain','縦横比維持の指定がない');
+        logs.push(`PASS panel=${before}px image=${image.width}×${image.height}`);
+      }
+      const card=document.createElement('div');card.className='candidate-card';
+      const editor=document.createElement('div');editor.className='question-editor';
+      const label=document.createElement('label'),preview=document.createElement('img');preview.src=images[0].dataUrl;
+      label.append(preview);editor.append(label);card.append(editor);root.getElementById('question-candidates-list').append(card);
+      root.getElementById('question-candidates').open=true;await preview.decode();await settle();
+      const rect=preview.getBoundingClientRect();assert(Math.abs(rect.width/rect.height-40)<0.1,'編集画像の縦横比が変わった');
+      assert(Math.abs(panel.getBoundingClientRect().width-before)<1,'編集画像でパネル幅が変わった');card.remove();
+      api.render([]);await settle();assert(Math.abs(panel.getBoundingClientRect().width-before)<1,'画像を消したら幅が変わった');
+    }
+    api.install(350);const handle=root.querySelector('[data-resize="e"]'),before=panel.getBoundingClientRect();
+    handle.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,isPrimary:true,pointerId:71,clientX:before.right,clientY:before.top+40}));
+    window.dispatchEvent(new PointerEvent('pointermove',{pointerId:71,clientX:before.right+40,clientY:before.top+40}));
+    window.dispatchEvent(new PointerEvent('pointerup',{pointerId:71}));await settle();
+    const expected=Math.min(window.innerWidth-24,before.width+40);
+    assert(Math.abs(panel.getBoundingClientRect().width-expected)<1,'既存リサイズが動かない');
+    assert(Math.abs(api.saved().width-expected)<1,'リサイズ後の幅が記録されない');
+    assert(JSON.stringify(images)===original,'原画像データが変化した');
+    assert(getComputedStyle(panel).overflow==='visible','外側リサイズハンドルが切り取られる');
+    logs.push('PASS 既存リサイズ・幅保存・原画像不変・ハンドル非クリップ');
+    results.textContent=logs.join('\n');
+  }catch(error){results.textContent=logs.join('\n')+'\nFAIL '+error.message;cleanup();}
+};
+</script>

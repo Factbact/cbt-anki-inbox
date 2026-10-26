@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.17
+// @version      6.19
 // @description  CBT Medilink専用。理由をワンタップで記録し、今の問題の候補をその場で編集・取り消し。演習別保存・科目の自動判定に対応。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
@@ -40,6 +40,7 @@
   let stagedReason = "";
   let questionEditor = null;
   let questionListSignature = "";
+  let renderedCandidateScopeKey = null;
   let lastSelectedText = "";
   let hoveredImage = null;
   let toastTimer = null;
@@ -504,6 +505,16 @@
   function getCurrentSessionItems() {
     const scopeKey = getCurrentScopeKey();
     return scopeKey ? getItemsForScope(scopeKey) : [];
+  }
+
+  function getEmptyCurrentCandidatesMessage() {
+    const hasOtherItems = getItems().length > 0;
+    const message = getActiveExerciseSession()
+      ? "この演習の手動候補は0件です。"
+      : "現在の演習を確認できないため、手動候補を表示できません。";
+    return message + (hasOtherItems
+      ? " 保存済みの候補は残っています。「過去の演習」で確認できます。"
+      : "");
   }
 
   // =========================================================
@@ -1954,7 +1965,9 @@
     const meta = getScopeMeta(scopeKey);
 
     if (!items.length) {
-      toast("この演習の候補はありません");
+      toast(scopeKey === getCurrentScopeKey()
+        ? getEmptyCurrentCandidatesMessage()
+        : "この演習の候補はありません");
       return;
     }
 
@@ -2080,7 +2093,7 @@
     const scopeKey = getCurrentScopeKey();
 
     if (!scopeKey) {
-      toast("QBの演習画面で実行してください");
+      toast(getEmptyCurrentCandidatesMessage());
       return;
     }
 
@@ -2715,6 +2728,34 @@
     object-fit: contain;
     background: #fff;
   }
+
+  /* v6.18: image intrinsic width must not enlarge the user-sized panel. */
+  #panel {
+    contain: inline-size;
+    min-width: 0;
+    max-width: calc(100vw - 24px);
+  }
+  #panel-content,
+  #image-preview-area,
+  .preview,
+  #question-candidates,
+  #question-candidates-list,
+  .candidate-card,
+  .question-editor,
+  .question-editor > label {
+    min-width: 0;
+    max-width: 100%;
+  }
+  #image-preview-area { width: 100%; }
+  .preview img { min-width: 0; max-width: 100%; }
+  .question-editor img {
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 90px;
+    object-fit: contain;
+  }
+  /* End v6.18 image width containment. */
 
   .remove-image {
     position: absolute;
@@ -4391,8 +4432,7 @@
     if (items.length === 0) {
       const empty = document.createElement("div");
       empty.className = "candidate-empty";
-      empty.textContent =
-        "この演習では、まだ手動候補を追加していません。";
+      empty.textContent = getEmptyCurrentCandidatesMessage();
       list.appendChild(empty);
       return;
     }
@@ -4649,6 +4689,7 @@
     renderAutomaticOverrideButton();
     renderCurrentAutomaticOverrideList();
     renderExerciseHistory();
+    renderedCandidateScopeKey = getCurrentScopeKey();
   }
 
   function toast(message) {
@@ -4913,6 +4954,13 @@
 
     if (isQBQuizPage()) {
       ensureActiveExerciseSession();
+    }
+
+    // 遅れて判明した演習や別タブで切り替わった演習を、件数・一覧にも反映する。
+    // 保存/出力の対象と表示中の演習が食い違わないよう、実際に変わった時だけ再描画。
+    if (renderedCandidateScopeKey !== getCurrentScopeKey()) {
+      updateUI();
+      return;
     }
 
     updateQuestionDisplay();

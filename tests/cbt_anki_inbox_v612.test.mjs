@@ -85,4 +85,10 @@ test('理由だけの候補は編集後の理由と本文の表示が一致す�
  assert.equal(t.c.commitQuestionEdit(item,item.rawText,'鑑別で迷った',[]),true);
  assert.equal(t.items()[0].rawText,'追加理由：鑑別で迷った');assert.equal(t.items()[0].captureReason,'鑑別で迷った');
 });
+test('横長・通常画像を候補保存とQB全問JSONで原データのまま保持',()=>{
+ const t=setup();const images=[{width:12000,height:300,dataUrl:'data:image/png;base64,d2lkZQ=='},{width:640,height:480,dataUrl:'data:image/png;base64,bm9ybWFs'}];
+ t.node('memory-text').value='画像の確認';t.c.stagedImages=clone(images);t.c.saveDraftAsCandidates();assert.deepEqual(t.items()[0].images,images);
+ const exported=t.c.getQBExporterCodeWithManualCandidates();const line=exported.split('\n').find(l=>l.includes('const INBOX_MANUAL_CANDIDATES = '));
+ const values=JSON.parse(line.split(' = ')[1].slice(0,-1));assert.deepEqual(values[0].images,images);
+});
 console.log(`${total} tests passed`);
