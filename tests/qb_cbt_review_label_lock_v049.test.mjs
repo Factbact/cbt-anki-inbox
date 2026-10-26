@@ -30,7 +30,7 @@ function simulation(initial={}) {
  setAnswer(value){answerContext=value;},getAnswer(){return answerContext;},getUndo(){return lastAutomatic;}};
   if (document.readyState === 'loading')`);
  const fixedDate=class extends Date{constructor(...args){super(...(args.length?args:['2026-10-25T03:00:00Z']));}static now(){return new Date('2026-10-25T03:00:00Z').getTime();}};
- const context=vm.createContext({__sim:sim,localStorage,window:{setTimeout(fn){sim.timers.push(fn)},innerWidth:1000,innerHeight:800},document:{readyState:'loading',addEventListener(){},querySelectorAll(){return []}},location:{href:'https://cbt.medilink-study.com/quiz?question_id=q123'},URL,Intl,Date:fixedDate,structuredClone,console});
+ const context=vm.createContext({__sim:sim,localStorage,window:{setTimeout(fn){sim.timers.push(fn)},innerWidth:1000,innerHeight:800},document:{readyState:'loading',addEventListener(){},querySelectorAll(){return []}},location:{href:'https://cbt.medilink-study.com/quiz?question_id=q123',hostname:'cbt.medilink-study.com',pathname:'/quiz'},URL,Intl,Date:fixedDate,structuredClone,console});
  vm.runInContext(code,context,{timeout:2000});
  const T=context.T;
  T.setUI({shadow:{getElementById:node},host:{style:{},getBoundingClientRect(){return {left:0,top:0,width:280,height:300}}}});
@@ -105,7 +105,10 @@ test('一般のメッセージに切り替えたら古い対処ボタンを消�
 });
 test('正誤・前回評価の読取と履歴からの昇格根拠は基準版を維持',()=>{
  const extract=s=>s.slice(s.indexOf('  const normalize = '),s.indexOf('  function decideSmart('));
- assert.equal(extract(source),extract(baseline));
+ // v0.4.10はquiz入場まで初回履歴読込を遅らせる。読取関数自体・判定処理は不変。
+ const startupOnly="  // 非quizページでは遷移監視だけを準備し、既存履歴の読込/旧履歴退避は行わない。\n  let historyLoaded=isQuizPage();\n  let history=historyLoaded?readSmartHistory():Object.create(null);";
+ assert.ok(source.includes(startupOnly));
+ assert.equal(extract(source).replace(startupOnly,'  let history=readSmartHistory();'),extract(baseline));
 });
 test('画面反映を確認できないときは再クリック・履歴更新をしない',()=>{
  const c=simulation();const old=c.data.get('qbCbtReviewLock.smartHistory.v1');

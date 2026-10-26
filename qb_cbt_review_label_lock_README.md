@@ -1,4 +1,4 @@
-# QB CBT 復習ラベル管理 v0.4.9
+# QB CBT 復習ラベル管理 v0.4.10
 
 QBオンラインCBT用のTampermonkeyスクリプト。既存の「CBT Anki 追加箱」と独立している。Mac / Windowsとも同じ配布URLを使用する。
 
@@ -6,11 +6,28 @@ QBオンラインCBT用のTampermonkeyスクリプト。既存の「CBT Anki 追
 
 **[Tampermonkeyでインストール・更新](https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js)**
 
-1. Tampermonkeyを有効にしたブラウザでリンクを開き、バージョンが **0.4.9** と表示されることを確認する。
+1. Tampermonkeyを有効にしたブラウザでリンクを開き、バージョンが **0.4.10** と表示されることを確認する。
 2. 同名・同namespaceの既存スクリプトを更新する。別名で追加して二重起動しない。
 3. QB CBTを再読み込みし、パネルの「自動判定」を使用する。初期設定はOFF。従来の△固定・×固定も維持する。
 
 既存の設定・ボタン登録・履歴・パネル位置と大きさを削除する必要はない。`@version`、`@updateURL`、`@downloadURL`による更新を維持する。Tampermonkeyの設定によっては定期更新の反映に時間差があるため、すぐに更新する場合は上のリンクを使う。
+
+## v0.4.10：起動と画面遷移からの復旧
+
+- 検索/科目ページから画面内遷移でquizに入る場合に備え、読み込み対象を同じQBサイト内全体へ拡張。パネル表示・評価操作は演習画面だけで行い、追加grantはない。
+- UI生成・初回読取より先に再確認タイマーを登録し、bodyの遅延生成や初期化時の一時的な例外から再試行する。
+- サイトのDOM再生成でパネルが外された場合は同じパネルを再配置し、bodyが置換された場合は監視先も更新する。
+- 戻る/進む・ページ復帰に対応。演習画面を離れた時や復旧時は、古い待機中の自動操作を中止する。重複初期化でパネルやタイマーを増やさない。
+- 評価ルール、保存関数、設定/学習記録の形式は変更なし。非演習画面では履歴読込や旧履歴の退避も行わない。Anki追加箱は変更しない。
+
+**検証**：起動系12件と既存15件の計27テスト、構文検査、HTML構造検査に合格。旧版でbody遅延・初回読取例外・パネル除去から復旧しないことを模擬再現し、修正版で解消を確認。実QB/Tampermonkey上の動作と本人環境の直接原因は未確認。
+
+```sh
+deno check qb_cbt_review_label_lock.user.js
+deno run --allow-read=. tests/qb_cbt_review_label_lock_v0410_startup.test.mjs
+deno run --allow-read=. tests/qb_cbt_review_label_lock_v049.test.mjs
+python3 tests/qb_cbt_review_label_lock_markup.py
+```
 
 ## v0.4.9：判定状態と昇格理由を見やすく
 

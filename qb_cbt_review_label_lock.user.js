@@ -1,18 +1,18 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.9
+// @version      0.4.10
 // @description  コンパクトな復習パネル。判定の待機・停止理由と必要な対処、正解日の加算・昇格根拠を表示。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
-// @match        https://cbt.medilink-study.com/quiz*
+// @match        https://cbt.medilink-study.com/*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
 
 /*
- * QB CBT 復習ラベル管理 0.4.9（ローカル検証版）
+ * QB CBT 復習ラベル管理 0.4.10
  *
  * ■ スマートモード（手動で有効化、初期値OFF）
  *   前回 ◎/○/△/× と今回の正解/不正解で評価を更新。
@@ -392,7 +392,9 @@
       return safe;
     } catch (_) {return Object.create(null);}
   }
-  let history=readSmartHistory();
+  // 非quizページでは遷移監視だけを準備し、既存履歴の読込/旧履歴退避は行わない。
+  let historyLoaded=isQuizPage();
+  let history=historyLoaded?readSmartHistory():Object.create(null);
   function saveSmartHistory() {
     try {
       const data=JSON.stringify(history);
@@ -1785,48 +1787,113 @@
     }
   }
 
+  let lifecycleStarted=false;
+  let lifecycleObserver=null;
+  let observedBody=null;
+  let wasQuizPage=false;
+  let lastLifecycleError='';
+
+  function stopPendingForLifecycle() {
+    if(scanTimer!==null)window.clearTimeout(scanTimer);
+    scanTimer=null;
+    pending=null;learning=false;learningTarget=null;
+    ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;progressNotice=null;
+    pageWasAnswerable=false;
+    previousSnapshots.delete(questionId());answerSnapshots.delete(questionId());
+    reactReadCache={q:null,at:0,item:null};
+  }
+
+  function disconnectLifecycleObserver() {
+    lifecycleObserver?.disconnect();
+    observedBody=null;
+  }
+
+  function reportLifecycleError(error) {
+    // 初期読取やDOMの一時的不整合で、以後の起動監視まで失わない。
+    // 中断した評価処理は再開せず、次の明示的な解答操作を待つ。
+    stopPendingForLifecycle();
+    const message=String(error?.message || error);
+    if(message!==lastLifecycleError)console.warn('[QB復習アシスト] 起動/画面読取を再確認します:',error);
+    lastLifecycleError=message;
+    try {setInfo('画面の読み取りを中断しました。表示を再確認します。待機中の自動操作は取り消しました。','warn');}catch(_){}
+  }
+
+  function maintainLifecycle() {
+    try {
+      if(!isQuizPage()) {
+        if(wasQuizPage || pending)stopPendingForLifecycle();
+        wasQuizPage=false;lastUrl=location.href;
+        historyLoaded=false;
+        if(ui)ui.host.style.display='none';
+        disconnectLifecycleObserver();
+        return;
+      }
+      if(!document.body)return; // bodyの遅延生成は次の監視で再試行する。
+      let restored=false;
+      if(!ui) {
+        try {if(!installUI())return;}
+        catch(error) {ui?.host.remove();ui=null;throw error;}
+        restored=true;
+      } else if(!ui.host.isConnected) {
+        // QBのDOM再生成で外された、自分が作成したパネルだけを戻す。
+        document.body.append(ui.host);
+        restored=true;
+      }
+      ui.host.style.display='';
+      if(observedBody!==document.body) {
+        disconnectLifecycleObserver();
+        lifecycleObserver.observe(document.body,{subtree:true,childList:true,characterData:true,
+          attributes:true,attributeFilter:['class','aria-pressed','aria-checked','data-state','hidden']});
+        observedBody=document.body;
+      }
+      if(!historyLoaded) {history=readSmartHistory();historyLoaded=true;}
+      const changed=!wasQuizPage || location.href!==lastUrl || restored;
+      if(changed) {
+        stopPendingForLifecycle();
+        lastUrl=location.href;wasQuizPage=true;
+        setInfo(config.mode === 'off'
+          ? 'OFF。通常のQB動作。'
+          : config.mode==='smart'? '自動判定モード。判定不能な場合はQBの評価を変更しない。'
+          : `${LABELS[config.mode]}固定で待機中。評価対象の問題を絞り込むこと。`);
+        applyPanelGeometry();positionPanel(config.position);
+        refreshSmartInfo();
+      }
+      if(pending)queueScan();else pollBeforeAnswer(changed);
+      lastLifecycleError='';
+    } catch(error) {reportLifecycleError(error);}
+  }
+
   function start() {
-    if (!isQuizPage()) return;
-    if (!installUI()) return;
-    pollBeforeAnswer(true);
-    document.addEventListener('click', onUserClick, true);
-    const observer = new MutationObserver(records => {
+    if(lifecycleStarted) {maintainLifecycle();return;}
+    lifecycleStarted=true;
+    // UIの生成/最初の読取より先に再試行経路を用意する。
+    lifecycleObserver=new MutationObserver(records=>{
       if(records.every(r=>ui?.host===r.target||ui?.host.contains(r.target)))return;
-      queueScan();
-      if(!pending)pollBeforeAnswer();
+      maintainLifecycle();
     });
-    observer.observe(document.body, {subtree:true,childList:true,characterData:true,
-      attributes:true,attributeFilter:['class','aria-pressed','aria-checked','data-state','hidden']});
+    window.setInterval(maintainLifecycle,450);
+    window.addEventListener('popstate',maintainLifecycle);
+    window.addEventListener('pageshow',maintainLifecycle);
+    window.addEventListener('pagehide',()=>{
+      stopPendingForLifecycle();wasQuizPage=false;disconnectLifecycleObserver();
+    });
+    document.addEventListener('click',e=>{
+      if(isQuizPage() && ui?.host.isConnected)onUserClick(e);
+    },true);
     window.addEventListener('storage',e=>{
       if(e.key!==SMART_HISTORY_KEY)return;
+      if(!isQuizPage()) {historyLoaded=false;return;}
       history=readSmartHistory();
       ++operationNonce;pending=null;lastAutomatic=null;answerContext=null;lastDecision=null;progressNotice=null;
       refreshSmartInfo();
       setInfo('別のタブで履歴が更新されたため、待機中の自動操作を停止した。','warn');
     });
     window.addEventListener('resize', () => {
+      if(!isQuizPage())return;
       applyPanelGeometry();
       if (config.position) positionPanel(config.position);
     });
-    window.setInterval(() => {
-      if (location.href !== lastUrl) {
-        lastUrl = location.href;
-        pageWasAnswerable=false;
-        previousSnapshots.delete(questionId());answerSnapshots.delete(questionId());
-        reactReadCache={q:null,at:0,item:null};
-        pending = null;
-        learning = false;learningTarget=null;
-        ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;progressNotice=null;
-        setInfo(config.mode === 'off'
-          ? 'OFF。通常のQB動作。'
-          : config.mode==='smart'? '自動判定モード。判定不能な場合はQBの評価を変更しない。'
-          : `${LABELS[config.mode]}固定で待機中。評価対象の問題を絞り込むこと。`);
-        pollBeforeAnswer(true);
-        refreshSmartInfo();
-      }
-      // DOM mutation is not guaranteed when React data finishes loading.
-      if(pending)queueScan();else pollBeforeAnswer();
-    }, 450);
+    maintainLifecycle();
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {once:true});
