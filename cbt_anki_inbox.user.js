@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.21
+// @version      6.22
 // @description  CBT Medilink専用。理由をワンタップで記録し、今の問題の候補をその場で編集・取り消し。演習別保存・科目の自動判定に対応。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
@@ -2942,6 +2942,21 @@
     color: #6b7280;
   }
 
+  #inbox-help {
+    min-width: 0;
+    max-width: 100%;
+    margin-top: 10px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  #inbox-help > summary {
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    color: #075b8b;
+  }
+
   #toast {
     position: absolute;
     left: 0;
@@ -3160,16 +3175,18 @@
     <button id="copy-qb-exporter" class="secondary copy-tool">
       QB取得コードをコピー
     </button>
+  </div>
+
+  <details id="inbox-help">
+    <summary>使い方</summary>
     <div class="backup-help">
       ① コピー → ② Chromeの開発者ツールでConsoleを開く → ③ 貼り付けてEnter → ④「取得開始」
     </div>
-  </div>
-
   <div class="help">
     パネルの上下左右の辺・4隅をドラッグしてサイズ変更できる。右辺も含め、端にカーソルを合わせると掴める。<br>
     科目自動判定ONでは、selection / chapter_code を使って科目ページ→検索結果→問題画面まで追跡。判定不能時は黄色で警告。<br>
     同じchapter_codeの未完了演習は、quizへ入り直しても同じセッションを再利用します。「全問再復習」→全問取得でも候補は過去扱いになりません。<br>
-    「QB全問＋手動候補を取得」で統合JSONを実際に保存すると、その演習を完了扱いにします。次回同じ科目を始めた時は新しいセッションになります。<br>
+    「QB全問＋手動候補を取得」で出力した候補は「ダウンロード要求済み・保存未確認」として記録します。保存成功や演習完了とは扱わず、同じchapter_codeの未完了演習は再利用します。<br>
     手動候補がある問題は原則「手動のみ」。必要な問題だけ「この問題は自動カードも作る」をON。<br>
     ○・◎でも自動カードが欲しい問題は「○・◎でもこの問題を自動カード化」を押す。手動候補なしでも有効。<br>
     画像・文字はドラッグ＆ドロップのほか、ドロップ枠をクリックして ⌘V / Ctrl+V でも貼り付け可能。<br>
@@ -3177,6 +3194,7 @@
     手動カードID：<b>qb:QBID:manual:連番</b><br>
     manual IDは重複防止のため通算。候補を削除しても番号は戻らない。
   </div>
+  </details>
   </div><!-- /#panel-content -->
 </div>
 
