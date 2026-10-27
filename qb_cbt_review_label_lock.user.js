@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.10
+// @version      0.4.11
 // @description  コンパクトな復習パネル。判定の待機・停止理由と必要な対処、正解日の加算・昇格根拠を表示。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -12,7 +12,7 @@
 // ==/UserScript==
 
 /*
- * QB CBT 復習ラベル管理 0.4.10
+ * QB CBT 復習ラベル管理 0.4.11
  *
  * ■ スマートモード（手動で有効化、初期値OFF）
  *   前回 ◎/○/△/× と今回の正解/不正解で評価を更新。
@@ -53,7 +53,7 @@
   Object.defineProperty(window, '__QB_CBT_REVIEW_LABEL_LOCK__', {value: true, configurable: false});
 
   const KEY = 'qbCbtReviewLock.v1';
-  const DEFAULTS = {mode: 'off', collapsed: false, position: null, geometry: null, learned: {triangle: null, wrong: null, correct: null, perfect: null}};
+  const DEFAULTS = {mode: 'off', lastActiveMode: 'smart', collapsed: false, position: null, geometry: null, learned: {triangle: null, wrong: null, correct: null, perfect: null}};
   const LABELS = {triangle: '△', wrong: '×', correct:'○', perfect:'◎', smart: '自動', off: 'OFF'};
   const SMART_HISTORY_KEY = 'qbCbtReviewLock.smartHistory.v1';
   const LEGACY_BACKUP_KEY = 'qbCbtReviewLock.smartHistory.pre040.backup';
@@ -66,6 +66,9 @@
       const loaded = JSON.parse(localStorage.getItem(KEY) || '{}');
       return {
         mode: ['off','triangle','wrong','smart'].includes(loaded.mode) ? loaded.mode : 'off',
+        lastActiveMode: ['triangle','wrong','smart'].includes(loaded.lastActiveMode)
+          ? loaded.lastActiveMode
+          : (['triangle','wrong','smart'].includes(loaded.mode) ? loaded.mode : 'smart'),
         collapsed: Boolean(loaded.collapsed),
         geometry: loaded.geometry && Number.isFinite(loaded.geometry.width) && Number.isFinite(loaded.geometry.height)
           ? {width:loaded.geometry.width,height:loaded.geometry.height} : null,
@@ -1335,6 +1338,34 @@
     sh.getElementById('apply').disabled = config.mode === 'off';
     sh.getElementById('modeName').textContent = config.mode === 'off' ? 'OFF' : smart ? '自動ON' : `${LABELS[config.mode]}固定`;
     sh.getElementById('modeName').dataset.mode = config.mode;
+    const assistToggle=sh.getElementById('assistToggle');
+    const active=config.mode!=='off';
+    assistToggle.textContent=active?'ON':'OFF';
+    assistToggle.dataset.active=String(active);
+    assistToggle.setAttribute('aria-pressed',String(active));
+    assistToggle.setAttribute('aria-label',active
+      ? `復習アシストをオフにする（現在：${sh.getElementById('modeName').textContent}）`
+      : `復習アシストをオンにする（${LABELS[config.lastActiveMode]||'自動'}で再開）`);
+  }
+
+  function setMode(nextMode, source='settings') {
+    if(!['off','triangle','wrong','smart'].includes(nextMode) || nextMode===config.mode)return false;
+    if(config.mode!=='off')config.lastActiveMode=config.mode;
+    if(nextMode!=='off')config.lastActiveMode=nextMode;
+    config.mode=nextMode;
+    learning=false;learningTarget=null;
+    if(scanTimer!==null)window.clearTimeout(scanTimer);
+    scanTimer=null;pending=null;
+    ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;progressNotice=null;
+    save();refreshUI();
+    if(config.mode==='smart' && !hasResultUI())startPreviousLookup(questionId());
+    setInfo(config.mode==='off'
+      ? '復習アシストはOFF。自動の評価変更を停止した。ヘッダーのOFFを押すと再開できる。'
+      : config.mode==='smart'?'復習アシストをONにした。前回評価と正誤を確実に読める問題だけ変更する。'
+      : `${LABELS[config.mode]}固定をONにした。${LABELS[config.mode]}のみの演習で使うこと。`,
+      (config.mode==='off'||config.mode==='smart')?'neutral':'warn');
+    if(source==='quick-toggle' && config.collapsed)applyPanelGeometry();
+    return true;
   }
 
   const MIN_PANEL_WIDTH=250, MIN_PANEL_HEIGHT=155, PANEL_MARGIN=8;
@@ -1436,6 +1467,8 @@
         #modeName {padding:3px 7px;border-radius:6px;background:#334155;color:#fff;font-weight:700;font-size:11px;white-space:nowrap}
         #modeName[data-mode="smart"] {background:#bfdbfe;color:#1e3a8a}
         #modeName[data-mode="triangle"],#modeName[data-mode="wrong"] {background:#eef2ff;color:#3730a3}
+        #assistToggle {min-width:42px;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#475569;color:#fff;border-color:#64748b}
+        #assistToggle[data-active="true"] {background:#16a34a;color:#fff;border-color:#86efac;box-shadow:0 0 0 2px rgba(134,239,172,.25)}
         button,select {font:inherit}
         button {border:1px solid #cbd5e1;background:#fff;color:#1e293b;border-radius:8px;cursor:pointer;padding:7px 10px;font-weight:600;transition:background .12s,border-color .12s}
         button:hover:not(:disabled) {background:#f1f5f9;border-color:#94a3b8}
@@ -1508,7 +1541,7 @@
         <span class="resize-handle resize-nw" data-resize="nw" aria-hidden="true"></span>
         <span class="resize-handle resize-se" data-resize="se" aria-hidden="true"></span>
         <span class="resize-handle resize-sw" data-resize="sw" aria-hidden="true"></span>
-        <div id="top" title="ドラッグして移動"><span id="title">QB 復習アシスト</span><button id="modeName" type="button" aria-label="動作モードの設定を開く">OFF</button><button id="toggle" type="button" aria-expanded="true">閉じる</button></div>
+        <div id="top" title="ドラッグして移動"><span id="title">QB 復習アシスト</span><button id="assistToggle" type="button" aria-pressed="false">OFF</button><button id="modeName" type="button" aria-label="動作モードの設定を開く">OFF</button><button id="toggle" type="button" aria-expanded="true">閉じる</button></div>
         <div id="main">
           <div id="smartSettings" hidden>
             <div id="smartCard" aria-label="現在の評価と昇格までの正解日数">
@@ -1588,6 +1621,9 @@
       sh.getElementById('mode').focus();
       sh.getElementById('mode').scrollIntoView({block:'nearest'});
     });
+    sh.getElementById('assistToggle').addEventListener('click',()=>{
+      setMode(config.mode==='off' ? config.lastActiveMode : 'off','quick-toggle');
+    });
     sh.getElementById('statusAction').addEventListener('click',()=>{
       const button=sh.getElementById('statusAction');
       openAssistTarget(button.dataset.action,button.dataset.label);
@@ -1609,16 +1645,7 @@
     });
 
     sh.getElementById('mode').addEventListener('change', e => {
-      config.mode = e.target.value;
-      learning = false;learningTarget=null;
-      pending = null;
-      ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;progressNotice=null;
-      save(); refreshUI();
-      if(config.mode==='smart' && !hasResultUI())startPreviousLookup(questionId());
-      setInfo(config.mode === 'off'
-        ? 'OFF。QB標準の自動評価に戻った。'
-        : config.mode==='smart'?'自動判定を有効化。前回評価と正誤を確実に読める問題だけ変更。'
-        : `${LABELS[config.mode]}固定を有効化。${LABELS[config.mode]}のみの演習で使うこと。`, (config.mode === 'off' || config.mode === 'smart') ? 'neutral' : 'warn');
+      setMode(e.target.value);
     });
     sh.getElementById('toggle').addEventListener('click', () => {
       config.collapsed = !config.collapsed;
@@ -1881,6 +1908,20 @@
       if(isQuizPage() && ui?.host.isConnected)onUserClick(e);
     },true);
     window.addEventListener('storage',e=>{
+      if(e.key===KEY) {
+        const next=readSettings();
+        if(next.mode!==config.mode || next.lastActiveMode!==config.lastActiveMode) {
+          if(scanTimer!==null)window.clearTimeout(scanTimer);
+          scanTimer=null;pending=null;learning=false;learningTarget=null;
+          ++operationNonce;answerContext=null;lastAutomatic=null;lastDecision=null;progressNotice=null;
+          Object.assign(config,next);
+          refreshUI();
+          if(!isQuizPage())return;
+          setInfo('別のタブのON／OFF設定を反映し、待機中の自動操作を停止した。','warn');
+          if(config.mode==='smart'&&!hasResultUI())startPreviousLookup(questionId());
+        }
+        return;
+      }
       if(e.key!==SMART_HISTORY_KEY)return;
       if(!isQuizPage()) {historyLoaded=false;return;}
       history=readSmartHistory();
