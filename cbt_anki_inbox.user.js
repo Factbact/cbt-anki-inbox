@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         CBT Anki 追加箱
 // @namespace    cbt-anki-inbox
-// @version      6.20
+// @version      6.21
 // @description  CBT Medilink専用。理由をワンタップで記録し、今の問題の候補をその場で編集・取り消し。演習別保存・科目の自動判定に対応。
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/cbt_anki_inbox.user.js
@@ -358,6 +358,42 @@
 
   function countUnexported(items) {
     return (items || []).filter(needsCandidateExport).length;
+  }
+
+  function sessionWarningSignature(items) {
+    return JSON.stringify((items || []).filter(needsCandidateExport).map(item => [
+      item.captureId || item.ankiId || "", item.updatedAt || item.savedAt || "",
+      item.exportRequest?.requestedAt || "", item.exportRequest?.imageErrors || 0
+    ]).sort((a,b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+  }
+
+  function isSessionWarningAcknowledged(session, items) {
+    return countUnexported(items) > 0 &&
+      session?.warningAcknowledgement?.signature === sessionWarningSignature(items);
+  }
+
+  function setSessionWarningAcknowledged(sessionId, acknowledged, expectedSignature) {
+    const state = getExerciseState();
+    const session = state.sessions?.[sessionId];
+    if (!session) { toast("対象の演習を確認できません。変更していません。"); return false; }
+    if (acknowledged) {
+      const items = getItemsForSession(sessionId);
+      const signature = sessionWarningSignature(items);
+      if (!countUnexported(items) || signature !== expectedSignature) {
+        toast("候補が変わったため警告を閉じていません。内容を確認し直してください。");
+        updateUI();return false;
+      }
+      session.warningAcknowledgement = {acknowledgedAt:new Date().toISOString(),signature};
+    } else {
+      delete session.warningAcknowledgement;
+    }
+    try { saveExerciseState(state); }
+    catch (_) { toast("警告の設定を保存できませんでした。"); return false; }
+    updateUI();
+    toast(acknowledged
+      ? "この演習の警告を対応済みにしました。候補は保持し、書き出し済みにはしていません。過去の演習で取り消せます。"
+      : "この演習の警告を再び表示する設定に戻しました。");
+    return true;
   }
 
   function needsCandidateExport(item) {
@@ -4530,13 +4566,16 @@
         group.meta?.sessionId
           ? getExerciseState().sessions?.[group.meta.sessionId]
           : null;
+      const warningAcknowledged = isSessionWarningAcknowledged(sessionState, group.items);
 
       summary.textContent =
         `${meta.subject || "科目不明"}${code}` +
         `｜${formatLocalDateTime(meta.startedAt)}` +
         `｜${group.items.length}件` +
         (unexported > 0
-          ? `｜⚠ 未書き出し${unexported}`
+          ? (warningAcknowledged
+            ? `｜警告対応済み（未書き出し${unexported}件は保持）`
+            : `｜⚠ 未書き出し${unexported}`)
           : "｜ダウンロード要求/書き出し記録あり（保存要確認）") +
         (sessionState
           ? (
@@ -4567,6 +4606,21 @@
       });
 
       body.appendChild(exportButton);
+
+      if (sessionState && unexported > 0) {
+        const acknowledgeButton = document.createElement("button");
+        acknowledgeButton.type = "button";
+        acknowledgeButton.className = "secondary";
+        acknowledgeButton.textContent = warningAcknowledged
+          ? "対応済みを取り消して警告を戻す" : "対応済みとして警告を閉じる";
+        acknowledgeButton.title = "この演習だけに適用。候補を削除せず、書き出し成功や演習完了にも変更しません。";
+        const signature = sessionWarningSignature(group.items);
+        acknowledgeButton.addEventListener("click", event => {
+          event.preventDefault();event.stopPropagation();
+          setSessionWarningAcknowledged(group.meta.sessionId, !warningAcknowledged, signature);
+        });
+        body.appendChild(acknowledgeButton);
+      }
 
       const historicalOverrides =
         getAutomaticOverridesForScope(group.scopeKey);
@@ -4643,13 +4697,26 @@
         : [];
       const pending = countUnexported(warningItems);
 
-      if (warningSession && pending > 0) {
+      if (warningSession && pending > 0 && !isSessionWarningAcknowledged(warningSession, warningItems)) {
+        const signature = sessionWarningSignature(warningItems);
+        const viewKey = JSON.stringify([warningId, warningSession.subject, pending, signature]);
+        if (warning.dataset.warningViewKey === viewKey) return;
+        warning.dataset.warningViewKey = viewKey;
         warning.classList.add("show");
         warning.textContent =
           `⚠ 前の演習「${warningSession.subject || "科目不明"}」に ` +
           `未書き出し候補が${pending}件あります。` +
           ` 下の「過去の演習」から内容を確認・書き出しできます。`;
+        const acknowledgeButton = document.createElement("button");
+        acknowledgeButton.type = "button";
+        acknowledgeButton.className = "secondary";
+        acknowledgeButton.textContent = "対応済みとして警告を閉じる";
+        acknowledgeButton.addEventListener("click", () => {
+          setSessionWarningAcknowledged(warningId, true, signature);
+        });
+        warning.appendChild(acknowledgeButton);
       } else {
+        delete warning.dataset.warningViewKey;
         warning.classList.remove("show");
         warning.textContent = "";
       }
@@ -4674,7 +4741,8 @@
     renderAutomaticOverrideButton();
     renderCurrentAutomaticOverrideList();
     renderExerciseHistory();
-    applySavedPanelGeometry();
+    // サイズ復元はcreateUI時だけ。開くたびに旧サイズを適用すると、
+    // 貼り付け/取り込み直後にfloating panelで調整した幅・高さが上書きされる。
   }
 
   function closePanel() {
