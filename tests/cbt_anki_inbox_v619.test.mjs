@@ -22,7 +22,7 @@ function setup(saved){
  const nodes=new Map(),node=id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id);};
  node('source').value='QB';node('division').value='臨床医学';node('subject').value='科目A';
  const location={href:'https://example.invalid/quiz?question_id=1'};
- const c=vm.createContext({
+ const c=vm.createContext({exportReceiptJobs:new Map(),
   ITEMS_KEY:'items',EXERCISE_STATE_KEY:'state',ROOT_ID:'root',renderedCandidateScopeKey:null,lastUrl:location.href,
   stagedImages:[],stagedReason:'',CAPTURE_REASONS:[],questionEditor:null,questionListSignature:'',location,
   GM_getValue:(k,d)=>clone(storage.has(k)?storage.get(k):d),GM_setValue:(k,v)=>storage.set(k,clone(v)),
@@ -41,7 +41,7 @@ function setup(saved){
   Blob,URL:{createObjectURL:blob=>{sim.blobs.push(blob);return 'blob:test';},revokeObjectURL(){}},
   setTimeout(){},Date,console
  });
- const names=['getItems','saveItems','getExerciseState','saveExerciseState','makeExerciseSessionId','getActiveExerciseSession','isSessionCompleted','getSessionChapterCode','findReusableExerciseSession','activateExerciseSession','getItemsForSession','countUnexported','createExerciseSession','ensureActiveExerciseSession','normalizeChapterCode','getLegacyGroupKey','getItemScopeKey','getCurrentScopeKey','getItemsForScope','getCurrentSessionItems','getAutomaticOverridesForSession','getCurrentAutomaticOverrides','getScopeMeta','getCandidateGroups','getDraftReason','clearDraftReason','saveDraftAsCandidates','buildCandidateCard','renderCurrentCandidateList','updateUI','monitorPage','getQBExporterCodeWithManualCandidates','exportCandidateScope','exportJSON'];
+ const names=['needsCandidateExport','candidateExportSignature','createExportReceipt','markItemsExportRequested','getItems','saveItems','getExerciseState','saveExerciseState','makeExerciseSessionId','getActiveExerciseSession','isSessionCompleted','getSessionChapterCode','findReusableExerciseSession','activateExerciseSession','getItemsForSession','countUnexported','createExerciseSession','ensureActiveExerciseSession','normalizeChapterCode','getLegacyGroupKey','getItemScopeKey','getCurrentScopeKey','getItemsForScope','getCurrentSessionItems','getAutomaticOverridesForSession','getCurrentAutomaticOverrides','getScopeMeta','getCandidateGroups','getDraftReason','clearDraftReason','saveDraftAsCandidates','buildCandidateCard','renderCurrentCandidateList','updateUI','monitorPage','getQBExporterCodeWithManualCandidates','exportCandidateScope','exportJSON'];
  if(source.includes('  function getEmptyCurrentCandidatesMessage('))names.push('getEmptyCurrentCandidatesMessage');
  vm.runInContext(names.map(fn).join('\n'),c);
  c.QB_EXPORTER_CODE=JSON.parse(source.match(/const QB_EXPORTER_CODE = (".*");/)[1]);
@@ -53,7 +53,7 @@ await test('複数手動追加を現演習へ保存し、一覧と手動JSONへ�
  t.node('memory-text').value='候補3';t.c.saveDraftAsCandidates();
  assert.equal(t.items().length,3);assert.ok(t.items().every(i=>i.exerciseSessionId==='a'&&i.automaticCardPolicy==='manual_only'&&!i.alsoCreateAutomatic));
  assert.equal(t.node('current-candidate-list').children.length,3);assert.equal(t.node('candidate-count').textContent,'3');
- await t.c.exportJSON();const output=JSON.parse(await t.sim.blobs[0].text());assert.deepEqual(output.candidates,t.items());assert.equal(output.count,3);
+ const beforeExport=t.items();await t.c.exportJSON();const output=JSON.parse(await t.sim.blobs[0].text());assert.deepEqual(output.candidates,beforeExport);assert.equal(output.count,3);
  assert.equal(output.exerciseSession.sessionId,'a');assert.match(t.sim.downloads[0],/^Anki追加候補_科目A_\d{4}-\d{2}-\d{2}_3件.json$/);
 });
 await test('再読込後も同演習の候補と原画像を維持',()=>{

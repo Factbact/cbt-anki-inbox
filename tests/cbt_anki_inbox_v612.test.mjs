@@ -15,7 +15,7 @@ function setup(initial=[]){
  }
  const nodes=new Map();const node=id=>{if(!nodes.has(id))nodes.set(id,new Node());return nodes.get(id)};
  node('subject').value='テスト科目';node('source').value='QB';node('division').value='臨床医学';
- const c=vm.createContext({CAPTURE_REASONS:['勘で正解','知識不足','鑑別で迷った','画像を覚えたい'],stagedReason:'',stagedImages:[],questionEditor:null,questionListSignature:'',ITEMS_KEY:'items',
+ const c=vm.createContext({exportReceiptJobs:new Map(),CAPTURE_REASONS:['勘で正解','知識不足','鑑別で迷った','画像を覚えたい'],stagedReason:'',stagedImages:[],questionEditor:null,questionListSignature:'',ITEMS_KEY:'items',
  shadow:{getElementById:node},document:{createElement:tag=>new Node(tag),createTextNode:text=>({textContent:text})},
  getItems:()=>clone(items),saveItems:value=>{if(sim.fail)throw Error('storage');items=clone(value);sim.writes++;},
  GM_setValue:(key,value)=>{if(sim.fail)throw Error('storage');items=clone(value);sim.writes++},
@@ -26,7 +26,7 @@ function setup(initial=[]){
  getNextManualAnkiId:()=>`qb:1001:manual:${++sim.seq}`,crypto:{randomUUID:()=>`capture:${sim.seq+1}`},
  toast:text=>sim.messages.push(text),confirm:()=>sim.confirm,location:{href:'https://example.invalid/quiz'},Date,console
  });
- const names=['getDraftReason','clearDraftReason','consumeReasonAfterOverride','renderReasonButtons','currentQuestionContext','candidateInContext','commitQuestionEdit','openQuestionEditor','renderQuestionCandidates','buildCandidateCard','buildAutomaticOverrideCard','updateOverrideReason','hasUnsavedDraft','saveDraftAsCandidates','deleteCandidateByCaptureId','setAutomaticOverrideForCurrentQuestion','getQBExporterCodeWithManualCandidates'];
+ const names=['needsCandidateExport','candidateExportSignature','createExportReceipt','markItemsExportRequested','getDraftReason','clearDraftReason','consumeReasonAfterOverride','renderReasonButtons','currentQuestionContext','candidateInContext','commitQuestionEdit','openQuestionEditor','renderQuestionCandidates','buildCandidateCard','buildAutomaticOverrideCard','updateOverrideReason','hasUnsavedDraft','saveDraftAsCandidates','deleteCandidateByCaptureId','setAutomaticOverrideForCurrentQuestion','getQBExporterCodeWithManualCandidates'];
  // Export code injection can be checked without executing its browser code.
  const embedded=source.split('\n').find(l=>l.includes('const QB_EXPORTER_CODE = '));
  c.QB_EXPORTER_CODE=JSON.parse(embedded.slice(embedded.indexOf(' = ')+3,-1));

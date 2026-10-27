@@ -1,0 +1,14 @@
+{
+  "sourceVersion": "6.19",
+  "functions": {
+    "cancelFallbackClose": "    function cancelFallbackClose() {\n      fallbackCloseGeneration += 1;\n      if (fallbackCloseTimer !== null) clearTimeout(fallbackCloseTimer);\n      fallbackCloseTimer = null;\n      cancelFallbackCloseButton.hidden = true;\n    }\n    window.addEventListener(\"pagehide\", cancelFallbackClose);\n    cancelFallbackCloseButton.addEventListener(\"click\", () => {\n      cancelFallbackClose();\n      saveStatus.textContent = \"自動で閉じるのを取り消しました。保存完了は未確認です。画面を残します。\";\n    });\n    const ownedDocument = document;\n    const ownedRoot = document.documentElement;\n    let preparedSave = null;\n    let saveBusy = false;\n    saveStatus.textContent = \"全件取得後、通常ダウンロードを要求して5秒後に閉じます（保存完了は未確認）。待機中は取消できます。\";\n",
+    "isOwnedExporter": "    function isOwnedExporter() {\n      try {\n        return window !== qb && window === window.top && window.opener === qb &&\n          !!qb && window.location.href === \"about:blank\" &&\n          document === ownedDocument && document.documentElement === ownedRoot;\n      } catch (_) { return false; }\n    }\n",
+    "closeOwnedExporter": "    function closeOwnedExporter() {\n      if (!isOwnedExporter()) {\n        saveStatus.textContent = \"取得ツールの画面を確認できないため、この画面は閉じません。\";\n        return;\n      }\n      try { window.close(); } catch (_) {}\n      saveStatus.textContent = \"閉じる操作を行いました。画面が残る場合は手動で閉じてください。\";\n    }\n",
+    "scheduleFallbackClose": "    function scheduleFallbackClose(prepared) {\n      if (prepared !== preparedSave || !prepared.complete || !prepared.requested ||\n          stopRequested || !isOwnedExporter()) return;\n      const generation = fallbackCloseGeneration;\n      cancelFallbackCloseButton.hidden = false;\n      saveStatus.textContent = \"ダウンロードを開始しました。5秒後に閉じます（保存完了は未確認）。\";\n      fallbackCloseTimer = setTimeout(() => {\n        if (generation !== fallbackCloseGeneration) return;\n        fallbackCloseTimer = null;\n        cancelFallbackCloseButton.hidden = true;\n        if (prepared === preparedSave && prepared.complete && prepared.requested &&\n            !running && !saveBusy && !stopRequested && isOwnedExporter()) {\n          closeOwnedExporter();\n        }\n      }, 5000);\n    }\n"
+  },
+  "grants": [
+    "// @grant        GM_getValue",
+    "// @grant        GM_setValue",
+    "// @grant        GM_xmlhttpRequest"
+  ]
+}
