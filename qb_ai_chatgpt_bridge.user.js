@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QB AI解説ブリッジ（プレビュー版）
 // @namespace    https://local.tools/qb-ai-chatgpt-bridge
-// @version      0.4.2-preview.12
+// @version      0.4.3-preview.13
 // @description  復習アシスト内で表示中のページ全文をコピー。ChatGPTは自分で開き、貼り付けます。外部送信なし。
 // @match        https://cbt.medilink-study.com/*
 // @run-at       document-idle
@@ -119,13 +119,13 @@
   function showManualCopy(text) {
     manualText.value = text;
     manualBox.hidden = false;
-    say('自動コピーはできませんでした。下の本文を選択してコピーしてください（Mac: ⌘A → ⌘C／Windows: Ctrl+A → Ctrl+C）。');
+    say('コピー失敗');
   }
 
   function fallback(text, number) {
     // A late failure from an earlier click must not overwrite a newer copy.
     if (number !== clickNumber) return;
-    if (legacyCopy(text)) say('ページ全文をコピーしました。貼り付け前に内容を確認してください。');
+    if (legacyCopy(text)) say('コピーしました');
     else showManualCopy(text);
   }
 
@@ -136,8 +136,8 @@
     manualBox.hidden = true;
     let text;
     try { text = collectPageText(); }
-    catch (error) { say(error.message || '表示中の本文を読み取れませんでした。'); return; }
-    say('コピーしています…');
+    catch (error) { say('コピー失敗'); return; }
+    say('');
     try {
       if (typeof navigator.clipboard?.writeText !== 'function') {
         fallback(text, number);
@@ -146,7 +146,7 @@
       // Invoked directly in the genuine click, before any await loses activation.
       const result = navigator.clipboard.writeText(text);
       Promise.resolve(result).then(() => {
-        if (number === clickNumber) say('ページ全文をコピーしました。貼り付け前に内容を確認してください。');
+        if (number === clickNumber) say('コピーしました');
       }, () => fallback(text, number));
     } catch (_) { fallback(text, number); }
   }
@@ -181,9 +181,6 @@
       button.textContent = 'ページ全文をコピー';
       button.style.cssText = 'width:100%;padding:9px 12px;border:1px solid #1d4ed8;border-radius:7px;background:#2563eb;color:#fff;font:inherit;font-weight:700;cursor:pointer;';
       button.addEventListener('click', onCopyClick);
-      const note = document.createElement('p');
-      note.style.cssText = 'margin:6px 0 0;font-size:11px;line-height:1.5;';
-      note.textContent = '表示中の全文には名前や学習履歴も含まれます。内容を確認し、自分で開いたChatGPTに⌘V／Ctrl+Vで貼り付けてください。外部への送信はしません。';
       statusNode = document.createElement('p');
       statusNode.style.cssText = 'margin:6px 0 0;font-size:11px;line-height:1.5;overflow-wrap:anywhere;';
       statusNode.setAttribute('role', 'status');
@@ -195,7 +192,7 @@
       manualText.style.cssText = 'box-sizing:border-box;width:100%;height:160px;max-height:35vh;margin-top:7px;resize:vertical;font:12px/1.5 sans-serif;';
       manualText.setAttribute('aria-label', '手動コピー用のページ全文');
       manualBox.append(manualText);
-      host.append(button, note, statusNode, manualBox);
+      host.append(button, statusNode, manualBox);
     }
     if (host.parentElement !== main) main.prepend(host);
   }
