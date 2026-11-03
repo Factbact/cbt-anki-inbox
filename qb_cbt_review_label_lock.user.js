@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.12-preview.6
+// @version      0.4.12-preview.7
 // @description  既存の解答後判定＋4項目全文照合で1クリックAI解説。条件不一致で停止する実機未確認試作。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -1991,7 +1991,7 @@
         return node.textContent;
       }
       if(!(node instanceof Element) || skipNodes.includes(node) || excluded(node,choiceButtons)) return '';
-      if(choiceButtons&&node.matches('[contenteditable],dialog,[role="dialog"],[role="menu"]'))return '';
+      if(node.matches('[contenteditable],dialog,[role="dialog"],[role="menu"]'))return '';
       if(node.tagName==='BR') {
         const s=getComputedStyle(node);
         return visible(node.parentElement)&&s.display!=='none'&&s.visibility!=='hidden' ? '\n' : '';
@@ -2006,7 +2006,7 @@
       if(/^(TD|TH)$/.test(node.tagName))return text+' \t ';
       return /^(P|DIV|LI|TR|H[1-6]|SECTION|ARTICLE|UL|OL|TABLE)$/.test(node.tagName) ? '\n'+text+'\n' : text;
     };
-    return {text:clean(walk(root)),media};
+    const raw=walk(root);return {text:clean(raw),media,raw};
   }
   function existingContext(){
     const request={protocol:'qb-ai-existing-v1',context:null};
@@ -2027,9 +2027,11 @@
     if(all.length>5000)throw new Error('画面が大きすぎるため自動抽出を止めました。');
     const candidates=all.filter(node=>!node.matches('html,body,main,#root,#__next')&&!node.closest('button,input,textarea,select,[contenteditable],nav,header,footer,aside,dialog,[role="dialog"],[role="menu"],#qb-cbt-review-label-lock-host')&&visible(node)&&!excluded(node));
     const cache=new Map();const read=node=>{if(!cache.has(node))cache.set(node,visibleText(node));return cache.get(node);};
+    const forbidden='button,input,textarea,select,[contenteditable],nav,header,footer,aside,dialog,[role="dialog"],[role="menu"]';
+    const unsafeField=(node,answer=false)=>[node,...node.querySelectorAll(forbidden+(answer?',table,[role="table"]':''))].some(n=>visible(n)&&(n.isContentEditable||n.matches(forbidden+(answer?',table,[role="table"]':''))));
     function unique(text,label,answer=false){
       const expected=canonical(text);
-      const matches=candidates.filter(node=>(!answer||!node.closest('table,[role="table"]'))&&canonical(read(node).text)===expected);
+      const matches=candidates.filter(node=>!unsafeField(node,answer)&&(!answer||!node.closest('table,[role="table"]'))&&canonical(read(node).text)===expected);
       const smallest=matches.filter(node=>!matches.some(other=>node!==other&&node.contains(other)));
       if(smallest.length!==1)throw new Error(label+'の現在表示を一意に照合できません（'+smallest.length+'候補）。送信しません。');
       if(read(smallest[0]).media)throw new Error(label+'に画像・図があるため送信しません。');
@@ -2039,31 +2041,159 @@
     const answerMatches=[];
     for(const label of ['正解：','正解:','正答：','正答:']){
       const expected=canonical(label+apiProjection.correctAnswer);
-      for(const node of candidates){if(node.closest('table,[role="table"]'))continue;const text=canonical(read(node).text).replace(/([：:])\s*/g,'$1');if(text===expected&&!answerMatches.includes(node))answerMatches.push(node);}
+      for(const node of candidates){if(node.closest('table,[role="table"]')||unsafeField(node,true))continue;const text=canonical(read(node).text).replace(/([：:])\s*/g,'$1');if(text===expected&&!answerMatches.includes(node))answerMatches.push(node);}
     }
     const answerNodes=answerMatches.filter(node=>!answerMatches.some(other=>node!==other&&node.contains(other)));
     if(answerNodes.length!==1)throw new Error('現在問の表示済み正答欄を一意に確認できません。履歴の正答は使いません。');
-    const answerNode=answerNodes[0],explanationNode=unique(apiProjection.explanation,'公式解説の全文');
-    const anchors=[qNode,answerNode,explanationNode,ctx.ratingRoot];
-    let anchorRoot=qNode;
-    while(anchorRoot&&!anchors.every(node=>anchorRoot.contains(node)))anchorRoot=anchorRoot.parentElement;
-    if(!anchorRoot||anchorRoot.matches('html,body,main,#root,#__next')||!visible(anchorRoot))throw new Error('現在問の表示領域を限定できません。');
-    const choiceMatch=matchChoices(anchorRoot,anchors,apiProjection,canonical);
-    const choicesNode=choiceMatch.root;
-    const nodes=[qNode,choicesNode,answerNode,explanationNode];
-    if(nodes.some((node,i)=>nodes.some((other,j)=>i!==j&&(node===other||node.contains(other)))))throw new Error('4項目の表示領域が重なっています。');
-    if(nodes.some(node=>ctx.ratingRoot.contains(node)||node.contains(ctx.ratingRoot)))throw new Error('自己評価欄と問題本文の境界が曖昧です。');
+    const answerNode=answerNodes[0],baseAnchors=[qNode,answerNode,ctx.ratingRoot];
     let root=qNode;
-    while(root&&!nodes.concat(ctx.ratingRoot).every(node=>root.contains(node)))root=root.parentElement;
-    if(!root||root.matches('html,body,main,#root,#__next')||!visible(root))throw new Error('4項目と現在の自己評価欄を同じ問題領域に結び付けられません。');
+    while(root&&!baseAnchors.every(node=>root.contains(node)))root=root.parentElement;
+    if(!root||root.matches('html,body,main,#root,#__next')||!visible(root))throw new Error('現在問の表示領域を限定できません。');
+    let explanationMatch;
+    for(;;){
+      try{explanationMatch=matchExplanation(root,baseAnchors,apiProjection,canonical);break;}
+      catch(err){
+        // Only an absent title permits looking at the next bounded ancestor.
+        // A present but incomplete/ambiguous explanation never falls through.
+        const parent=root.parentElement;
+        if(!err.noExplanationTitle||!parent||parent.matches('html,body,main,#root,#__next')||!visible(parent))throw err;
+        root=parent;
+      }
+    }
+    const anchors=[...baseAnchors,...explanationMatch.roots];
+    const choiceMatch=matchChoices(root,anchors,apiProjection,canonical);
+    const choicesNode=choiceMatch.root,nodes=[qNode,choicesNode,answerNode,...explanationMatch.roots];
+    if(nodes.some((node,i)=>nodes.some((other,j)=>i!==j&&(node===other||node.contains?.(other)||other.contains?.(node)))))throw new Error('4項目の表示領域が重なっています。');
+    if(nodes.some(node=>ctx.ratingRoot.contains(node)||node.contains?.(ctx.ratingRoot)))throw new Error('自己評価欄と問題本文の境界が曖昧です。');
     // Scan media only, not text, in the bounded current-question ancestor.
     const imageCSS=style=>/url\s*\(/i.test((style?.backgroundImage||'')+' '+(style?.maskImage||'')+' '+(style?.webkitMaskImage||'')+' '+(style?.content||''));
     const visual=[root,...root.querySelectorAll('*')];
     if(visual.some(node=>!ctx.ratingRoot.contains(node)&&visible(node)&&(node.matches('img,svg,canvas,video,audio,iframe,object,embed')||imageCSS(getComputedStyle(node))||imageCSS(getComputedStyle(node,'::before'))||imageCSS(getComputedStyle(node,'::after')))))throw new Error('現在問の領域に画像・図・音声があるため送信しません。');
-    const data={question:read(qNode).text,choices:choiceMatch.text,correctAnswer:read(answerNode).text,explanation:read(explanationNode).text};
-    const result={key:pageKey(),data,media:[],prompt:makePrompt(data,false),identityVerified:true,fingerprint:JSON.stringify(data),profileFingerprint:'existing-gate-v1:'+ctx.q,nodes:[root,...nodes,ctx.ratingRoot,...choiceMatch.evidence]};
+    const data={question:read(qNode).text,choices:choiceMatch.text,correctAnswer:read(answerNode).text,explanation:explanationMatch.text};
+    const result={key:pageKey(),data,explanationEvidence:explanationMatch.pieces,media:[],prompt:makePrompt(data,false),identityVerified:true,fingerprint:JSON.stringify(data),profileFingerprint:'existing-gate-v1:'+ctx.q,nodes:[root,...nodes,ctx.ratingRoot,...choiceMatch.evidence,...explanationMatch.evidence]};
     if(result.prompt.length>MAX_TEXT)throw new Error('依頼文が60,000文字を超えています。');
     qbCheckRenderedApi(result,apiProjection);return result;
+  }
+
+  function matchExplanation(root,anchors,projection,canonical) {
+    const structure=projection.explanationStructure,units=structure?.units;
+    if(!units?.length||units[0].kind!=='title')throw new Error('公式解説の照合構造がありません。');
+    const blocked='button,input,textarea,select,[contenteditable],nav,header,footer,aside,dialog,[role="dialog"],[role="menu"],#qb-cbt-review-label-lock-host';
+    const overlaps=node=>anchors.some(a=>a.contains(node)||node.contains(a));
+    const cache=new Map();const read=node=>{if(!cache.has(node))cache.set(node,visibleText(node));return cache.get(node);};
+    const all=[root,...root.querySelectorAll('*')];
+    if(all.length>5000)throw new Error('公式解説の候補領域が大きすぎます。');
+    const eligible=node=>visible(node)&&!node.isContentEditable&&!node.closest(blocked)&&!overlaps(node);
+    const smallest=nodes=>nodes.filter(node=>!nodes.some(other=>node!==other&&node.contains(other)));
+    const titleBlocked=blocked.replace('button,','');
+    const titleEligible=node=>visible(node)&&!node.isContentEditable&&!node.closest(titleBlocked)&&!overlaps(node)&&(!node.closest('button')||node.tagName==='BUTTON');
+    // A literal title button may be read, never clicked. Other buttons remain
+    // prohibited and cannot supply explanation body/reference text.
+    const titles=smallest(all.filter(node=>{
+      if(!titleEligible(node))return false;
+      const value=node.tagName==='BUTTON'?visibleText(node,true):read(node);
+      if(canonical(value.text)!=='解説'||value.media)return false;
+      if(node.tagName==='BUTTON')cache.set(node,value);
+      return true;
+    }));
+    if(!titles.length){const error=new Error('現在問の表示領域で公式解説の見出しを確認できません。');error.noExplanationTitle=true;throw error;}
+    const nextTitles=structure.nextTitle?smallest(all.filter(node=>eligible(node)&&canonical(read(node).text)===structure.nextTitle)):[];
+    const unsafe=node=>node instanceof Element&&visible(node)&&(node.isContentEditable||node.matches(blocked));
+    const descendants=node=>node instanceof Element?[node,...node.querySelectorAll('*')]:[];
+    const evidenceNodes=nodes=>{const out=[];const visit=n=>{out.push(n);for(const c of n.childNodes||[])visit(c);};for(const n of nodes)visit(n);return out;};
+    // A following BASIC boundary is accepted only at the first rendered content
+    // of a separate sibling branch. No arbitrary suffix is cut off.
+    function startsWithHeading(branch,heading){
+      let seen=false,bad=false;
+      const walk=n=>{if(bad||seen)return;if(n===heading){seen=true;return;}if(n instanceof Element&&!visible(n))return;if(n.nodeType===Node.TEXT_NODE){if(canonical(read(n).text))bad=true;return;}for(const c of n.childNodes||[])walk(c);};walk(branch);return seen&&!bad;
+    }
+    const successes=[];
+    for(const title of titles){
+      for(let parent=title.parentElement;parent&&root.contains(parent);parent=parent.parentElement){
+        if(!visible(parent))break;
+        let start=title;while(start.parentElement!==parent)start=start.parentElement;
+        const children=[...parent.childNodes],begin=children.indexOf(start);
+        if(begin<0)break;
+        let end=children.length,boundary=null;
+        for(let i=begin+1;i<children.length;i++){
+          const node=children[i];if(!(node instanceof Element))continue;
+          const found=nextTitles.filter(n=>node.contains(n)&&startsWithHeading(node,n));
+          if(found.length){if(found.length!==1){end=-1;break;}end=i;boundary=found[0];break;}
+        }
+        if(end<0)continue;
+        const region=children.slice(begin,end);
+        if(region.some(n=>n instanceof Element&&overlaps(n)))continue;
+        if(region.some(n=>descendants(n).some(child=>child!==title&&unsafe(child))))continue;
+        if(region.some(n=>read(n).media))continue;
+        let work=0;
+        function exact(text,offset){
+          if(offset>=units.length||!canonical(text))return null;
+          if(qbExplanationUnitMatches(units[offset],text))return {start:offset,end:offset+1,text};
+          if(units[offset].kind==='title'||units[offset].kind==='reference')return null;
+          const parts=[];
+          for(let i=offset;i<units.length;i++){
+            if(units[i].kind==='title'||units[i].kind==='reference')break;
+            parts.push(units[i].text);
+            if(parts.length>1&&canonical(parts.join('\n'))===canonical(text))return {start:offset,end:i+1,text};
+          }
+          return null;
+        }
+        function consume(node,offset){
+          if(++work>20000)throw new Error('公式解説の照合が複雑すぎます。');
+          const text=read(node).text;
+          if(!canonical(text))return {offset,pieces:[]};
+          // The exact title node must be consumed on its own. A wrapper cannot
+          // merge preceding text or a different section into the title anchor.
+          if(node===title){if(offset!==0)return null;return {offset:1,pieces:[{start:0,end:1,text}]};}
+          const containsTitle=node instanceof Element&&node.contains(title);
+          if(!containsTitle&&offset>0){const piece=exact(text,offset);if(piece)return {offset:piece.end,pieces:[piece]};}
+          if(node.nodeType===Node.TEXT_NODE)return null;
+          return consumeList([...node.childNodes],offset);
+        }
+        function consumeList(list,offset){
+          const pieces=[];
+          for(let i=0;i<list.length;i++){
+            const result=consume(list[i],offset);
+            if(result){offset=result.offset;pieces.push(...result.pieces);continue;}
+            // Whole adjacent nodes may form one body block or one reference
+            // footer. Never consume a substring of a node or any unseen text.
+            if(offset===0)return null;
+            let grouped=null;
+            for(let j=i+1;j<list.length;j++){
+              const group=list.slice(i,j+1);
+              if(group.some(n=>n===title||(n instanceof Element&&n.contains(title))))break;
+              let text=group.map(n=>read(n).raw).join('');
+              if(units[offset]?.kind==='reference'){
+                const parts=group.map(n=>read(n).text).filter(s=>canonical(s));
+                if(!parts.every(part=>units[offset].references.some(ref=>qbReferenceTextMatches(part,[ref]))))continue;
+                text=parts.join('\n');
+              }
+              const piece=exact(clean(text),offset);
+              if(piece){grouped={piece,end:j};break;}
+            }
+            if(!grouped)return null;
+            offset=grouped.piece.end;pieces.push(grouped.piece);i=grouped.end;
+          }
+          return {offset,pieces};
+        }
+        const result=consumeList(region,0);
+        if(!result||result.offset!==units.length)continue;
+        const text=qbValidateExplanationEvidence(result.pieces,projection);
+        // Ignore wrapper-only alternatives with the same exact title and
+        // content nodes; separate title/content sequences remain ambiguous.
+        const identities=evidenceNodes(region),textNodes=identities.filter(n=>n.nodeType===Node.TEXT_NODE&&canonical(read(n).text));
+        const same=successes.find(s=>s.title===title&&s.textNodes.length===textNodes.length&&s.textNodes.every((n,i)=>n===textNodes[i]));
+        if(!same)successes.push({title,roots:region.filter(n=>n instanceof Element||canonical(read(n).text)),text,pieces:result.pieces,textNodes,evidence:[parent,...identities,...(boundary?[boundary]:[])]});
+        if(parent===root)break;
+      }
+    }
+    if(successes.length!==1)throw new Error('公式解説の見出し・本文・参考表示を全件照合できません（'+successes.length+'領域）。送信しません。');
+    const match=successes[0];
+    // A second complete explanation outside the accepted titled region is not
+    // silently ignored, even if it has no repeated title.
+    const duplicates=all.filter(node=>eligible(node)&&!match.roots.some(n=>n===node||n.contains?.(node)||node.contains(n))&&canonical(read(node).text)===canonical(projection.explanation));
+    if(duplicates.length)throw new Error('別の公式解説表示が重複しているため送信しません。');
+    return match;
   }
 
   function matchChoices(root,anchors,projection,canonical) {
@@ -2168,31 +2298,96 @@ function qbProjectApi(raw,q,parse=qbApiText) {
   if(!Array.isArray(raw.boxes))throw new Error('APIの解説形式が未対応です。');
   const boxes=raw.boxes.filter(box=>isObject(box)&&box.description_code==='DESCRIPTION');
   if(boxes.length!==1||boxes[0].box_title!=='解説'||!Array.isArray(boxes[0].box_contents)||!boxes[0].box_contents.length)throw new Error('公式解説の箱を一意に確認できません。');
-  const parts=[];let leaves=0;
-  const heading=value=>{if(value===null||value===undefined||value==='')return;const text=parse(value);if(text)parts.push(text);};
+  const parts=[],units=[{kind:'title',text:'解説'}];let leaves=0;
+  const addContent=(kind,text,alias='')=>{parts.push(text);const lines=kind==='body'?text.split(/\n+/).filter(s=>s.trim()):[text];for(const line of lines)units.push({kind,text:line,...(alias?{alias}: {})});};
+  const heading=(value,section=false)=>{if(value===null||value===undefined||value==='')return;const text=parse(value);if(text)addContent('heading',text,section&&text==='ガイドライン'?'コア・カリキュラム':'');};
   for(const section of boxes[0].box_contents){
     if(!isObject(section)||!Array.isArray(section.sub_contents)||!section.sub_contents.length)throw new Error('公式解説の節が未対応です。');
-    heading(section.sub_title);
+    heading(section.sub_title,true);
     for(const sub of section.sub_contents){
       if(!isObject(sub)||!Array.isArray(sub.detail_contents)||!sub.detail_contents.length)throw new Error('公式解説の詳細が未対応です。');
       heading(sub.detail_title);
       for(const detail of sub.detail_contents){
         if(!isObject(detail))throw new Error('公式解説の本文が未対応です。');
-        const text=parse(detail.text);if(!text)throw new Error('公式解説の本文が空です。');parts.push(text);leaves++;
-        // reference_links intentionally ignored; never resolve or include URLs.
+        const text=parse(detail.text);if(!text)throw new Error('公式解説の本文が空です。');addContent('body',text);leaves++;
+        // Labels are comparison-only. Never read, resolve, store or send link URLs.
+        if(!Array.isArray(detail.reference_links))throw new Error('公式解説の参考表示形式が未対応です。');
+        const references=[];
+        for(const ref of detail.reference_links){
+          if(!isObject(ref)||typeof ref.text!=='string'||typeof ref.icon_type!=='string')throw new Error('公式解説の参考表示形式が未対応です。');
+          const label=parse(ref.text),icon=parse(ref.icon_type);
+          if(!label||!icon)throw new Error('公式解説の参考表示が空です。');
+          if(!/^(?:レビューブック (?:内科・外科|マイナー|産婦人科|公衆衛生|小児科)|イヤーノート(?:・(?:マイナー|アトラス|産婦人科|小児科))?|病気がみえる vol\.(?:[1-9]|1[0-5])|がんがみえる|公衆衛生がみえる|こころの健康がみえる|薬がみえる vol\.3|診察ができる vol\.[12])$/.test(icon))throw new Error('未対応の参考表示アイコンです。');
+          references.push(Object.freeze({text:label,icon}));
+        }
+        if(references.length>24)throw new Error('参考表示の件数が多すぎます。');
+        if(references.length)units.push({kind:'reference',references:Object.freeze(references)});
       }
     }
   }
   if(!leaves)throw new Error('公式解説を確認できません。');
   const data={question,choices:choices.map(c=>c.label+' '+c.text).join('\n'),correctAnswer:raw.correct_answers[0][0],explanation:parts.join('\n')};
   if(Object.values(data).some(s=>s.length>60000))throw new Error('APIの4項目が長すぎます。');
+  if(units.length>1000||units.reduce((n,u)=>n+(u.text?.length||0)+(u.references||[]).reduce((m,r)=>m+r.text.length+r.icon.length,0),0)>60000)throw new Error('公式解説の照合ブロックが多すぎます。');
+  const boxIndex=raw.boxes.indexOf(boxes[0]),following=raw.boxes[boxIndex+1];
+  const nextTitle=isObject(following)&&following.description_code==='BASIC'&&following.box_title==='基本事項など'?'基本事項など':'';
   Object.defineProperty(data,'choiceItems',{value:Object.freeze(choices.map(c=>Object.freeze({...c})))});
+  Object.defineProperty(data,'explanationStructure',{value:Object.freeze({units:Object.freeze(units.map(u=>Object.freeze(u))),nextTitle})});
   return Object.freeze(data);
+}
+
+// A reference footer is a complete exact multiset, never a global text removal.
+// Saved exports show reference reordering and these five Review Book badges.
+function qbReferenceTextMatches(text,references) {
+  const canonical=value=>String(value).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+  const badges={'レビューブック 内科・外科':'内','レビューブック マイナー':'マ','レビューブック 産婦人科':'産','レビューブック 公衆衛生':'公','レビューブック 小児科':'小'};
+  const groups=[];
+  for(const ref of references){const label=canonical(ref.text),badge=badges[ref.icon],tokens=[...new Set([label,...(badge?[badge+label,badge+' '+label]:[])])];const key=JSON.stringify(tokens);let g=groups.find(x=>x.key===key);if(g)g.count++;else groups.push({key,tokens,count:1});}
+  const source=canonical(text),memo=new Map();let work=0;
+  function visit(offset,counts){
+    while(source[offset]===' ')offset++;
+    if(offset===source.length)return counts.every(n=>n===0);
+    const key=offset+':'+counts.join(',');if(memo.has(key))return memo.get(key);
+    if(++work>3000)return false;
+    for(let i=0;i<groups.length;i++)if(counts[i])for(const token of groups[i].tokens){
+      const end=offset+token.length;
+      if(source.slice(offset,end)===token&&(end===source.length||source[end]===' ')){
+        const next=counts.slice();next[i]--;if(visit(end,next)){memo.set(key,true);return true;}
+      }
+    }
+    memo.set(key,false);return false;
+  }
+  return visit(0,groups.map(g=>g.count));
+}
+function qbExplanationUnitMatches(unit,text) {
+  const canonical=value=>String(value).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+  const actual=canonical(text);
+  if(unit.kind==='reference')return qbReferenceTextMatches(text,unit.references);
+  if(actual===canonical(unit.text))return true;
+  if(unit.kind==='heading'&&unit.text==='ガイドライン'&&unit.alias==='コア・カリキュラム'&&actual===unit.alias)return true;
+  return false;
+}
+function qbValidateExplanationEvidence(evidence,projected) {
+  const units=projected.explanationStructure?.units;
+  if(!units||!Array.isArray(evidence)||!evidence.length)throw new Error('公式解説の照合構造がありません。');
+  const canonical=value=>String(value).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+  let offset=0;const output=[];
+  for(const piece of evidence){
+    if(piece.start!==offset||!Number.isInteger(piece.end)||piece.end<=offset||piece.end>units.length||typeof piece.text!=='string')throw new Error('公式解説の照合順序が一致しません。');
+    const slice=units.slice(offset,piece.end);
+    if(slice.length===1){if(!qbExplanationUnitMatches(slice[0],piece.text))throw new Error('公式解説の表示ブロックが一致しません。');}
+    else if(slice.some(u=>u.kind==='reference'||u.kind==='title')||canonical(piece.text)!==canonical(slice.map(u=>u.text).join('\n')))throw new Error('公式解説の表示ブロックが一致しません。');
+    if(!slice.some(u=>u.kind==='reference'||u.kind==='title'))output.push(piece.text);
+    offset=piece.end;
+  }
+  if(offset!==units.length)throw new Error('公式解説に未確認のブロックがあります。');
+  return output.join('\n');
 }
 function qbCheckRenderedApi(rendered,projected) {
   const canonical=text=>String(text).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
   if(!rendered?.identityVerified)throw new Error('現在問の可視DOMとID対応が未確認です。');
-  for(const key of ['question','choices','explanation'])if(canonical(rendered.data[key])!==canonical(projected[key]))throw new Error('現在表示されている'+({question:'問題文',choices:'選択肢',explanation:'公式解説'}[key])+'とAPIの全文が一致しません。未表示部分は送信しません。');
+  for(const key of ['question','choices',...(rendered.explanationEvidence?[]:['explanation'])])if(canonical(rendered.data[key])!==canonical(projected[key]))throw new Error('現在表示されている'+({question:'問題文',choices:'選択肢',explanation:'公式解説'}[key])+'とAPIの全文が一致しません。未表示部分は送信しません。');
+  if(rendered.explanationEvidence&&canonical(rendered.data.explanation)!==canonical(qbValidateExplanationEvidence(rendered.explanationEvidence,projected)))throw new Error('公式解説の表示済みブロック照合が一致しません。');
   const answer=/^(?:正解|正答)\s*[:：]\s*([a-z])$/i.exec(canonical(rendered.data.correctAnswer));
   if(!answer||answer[1].toLowerCase()!==projected.correctAnswer)throw new Error('現在問の表示済み正答を確認できません。');
   // Return only the already-rendered DOM fields. API-only text is never the outgoing payload.
