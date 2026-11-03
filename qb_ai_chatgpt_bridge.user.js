@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QB AI解説ブリッジ（プレビュー版）
 // @namespace    https://local.tools/qb-ai-chatgpt-bridge
-// @version      0.2.0
+// @version      0.3.2
 // @description  確認した1問をChatGPTへ入力・任意の自動送信。送信試行は1回だけ。本文をURLに含めない。
 // @match        https://cbt.medilink-study.com/*
 // @match        https://chatgpt.com/*
@@ -41,42 +41,40 @@
     return [...el.getClientRects()].some(r=>r.width>0&&r.height>0);
   }
   function qbBranch() {
-    let busy=false;
-    // A second click on the same approved prompt in this tab cannot create another auto-send.
-    const recentlyStarted=new Map();
-    function attach() {
-      const host=document.getElementById('qb-ai-preview-host'), sh=host?.shadowRoot;
-      const actions=sh?.getElementById('qb-ai-transfer-actions');
-      if(!actions || actions.querySelector('#qb-ai-bridge-send'))return;
-      const send=document.createElement('button');send.id='qb-ai-bridge-send';send.type='button';send.textContent='ChatGPTで解説を開始（自動送信）';
-      send.style.cssText='background:#166534;color:white;border-color:#166534';actions.prepend(send);
-      const input=document.createElement('button');input.id='qb-ai-bridge-input';input.type='button';input.textContent='入力だけ（送信しない）';actions.append(input);
-      const note=sh.getElementById('bridge-note');
-      if(note)note.textContent='「解説を開始」は確認した依頼文を新規チャットへ入力し、送信ボタンを1回だけ押します。画像は未添付のままです。「入力だけ」なら送信しません。';
-      const start=(e,action)=>{
+    let busy=false;const recentlyStarted=new Map();
+    function attach(){
+      const panel=document.getElementById('qb-cbt-review-label-lock-host')?.shadowRoot;
+      const button=panel?.getElementById('qb-ai-explain'),transfer=panel?.getElementById('qb-ai-oneclick-transfer'),statusNode=panel?.getElementById('qb-ai-oneclick-status');
+      if(!button||!transfer||button.dataset.qbAiBridge==='oneclick-v1')return;
+      button.dataset.qbAiBridge='oneclick-v1';
+      const status=text=>{if(statusNode)statusNode.textContent=text;};
+      button.addEventListener('click',async e=>{
         if(!e.isTrusted||busy)return;
-        const message=sh.getElementById('message');const status=text=>{if(message)message.textContent=text;};
-        if(!/^\/quiz(?:\/|$)/.test(location.pathname)||!visible(host))return status('QBの問題プレビューから操作してください。');
-        const check=new Event('qb-ai-before-transfer',{cancelable:true});if(!host.dispatchEvent(check))return;
-        if(!sh.getElementById('approved')?.checked)return status('表示内容と送信先を確認し、同意欄にチェックしてください。');
-        const prompt=sh.getElementById('qb-ai-prompt')?.value;
-        if(typeof prompt!=='string'||!prompt.trim()||prompt.length>LIMIT)return status('依頼文が空か、60,000文字を超えています。');
-        for(const [text,until] of recentlyStarted)if(until<=now())recentlyStarted.delete(text);
-        if(action==='send'&&recentlyStarted.has(prompt))return status('この依頼は既に開始しています。二重送信防止のため5分間は再度開始しません。先ほど開いたChatGPTタブを確認してください。');
-        busy=true;send.disabled=input.disabled=true;let key;
-        try {
-          purge();const nonce=randomNonce(), createdAt=now();key=PREFIX+nonce;
-          GM_setValue(key,{schema:2,nonce,action,createdAt,expiresAt:createdAt+TTL,prompt});
-          if(action==='send')recentlyStarted.set(prompt,createdAt+TTL);
+        const id=transfer.dataset.requestId;
+        if(!NONCE.test(id||'')||transfer.dataset.state!=='reading')return;
+        busy=true;let key;
+        const finish=()=>{if(transfer.dataset.requestId===id){transfer.textContent='';transfer.dataset.state='consumed';transfer.dispatchEvent(new Event('qb-ai-transfer-finished'));}busy=false;};
+        try{
+          const deadline=now()+10000;
+          while(now()<deadline&&transfer.isConnected&&transfer.dataset.requestId===id&&transfer.dataset.state==='reading')await new Promise(resolve=>setTimeout(resolve,100));
+          if(!/^\/quiz(?:\/|$)/.test(location.pathname)||!transfer.isConnected||transfer.dataset.requestId!==id||transfer.dataset.state!=='ready')return;
+          if(transfer.dataset.action!=='send')throw new Error('送信の指定を確認できません。');
+          const before=transfer.textContent;transfer.dataset.validatedRequest='';
+          const check=new Event('qb-ai-before-transfer',{cancelable:true});if(!transfer.dispatchEvent(check))return;
+          if(transfer.dataset.validatedRequest!==id||transfer.dataset.requestId!==id||transfer.dataset.state!=='ready'||transfer.textContent!==before)throw new Error('現在問の再確認応答が一致しません。');
+          const prompt=transfer.textContent;
+          if(typeof prompt!=='string'||!prompt.trim()||prompt.length>LIMIT)throw new Error('依頼文が空か長すぎます。');
+          for(const [text,until] of recentlyStarted)if(until<=now())recentlyStarted.delete(text);
+          if(recentlyStarted.has(prompt)){status('同じ依頼は既に開始しています。二重送信防止のため5分間は再開始しません。開いたChatGPTタブを確認してください。');return;}
+          purge();const nonce=randomNonce(),createdAt=now();key=PREFIX+nonce;
+          GM_setValue(key,{schema:2,nonce,action:'send',createdAt,expiresAt:createdAt+TTL,prompt});
+          recentlyStarted.set(prompt,createdAt+TTL);
           GM_openInTab(CHAT+'/#qb-ai='+nonce,{active:true,insert:true,setParent:false});
           setTimeout(()=>GM_deleteValue(key),TTL);
-          status(action==='send'?'ChatGPTタブを開くよう依頼しました。入力欄と送信ボタンを確認できた場合のみ1回送信します。不明な結果を自動再送しません。':'ChatGPTタブを開くよう依頼しました。入力だけ行い、送信はしません。');
-        } catch(_) {
-          if(key)try{GM_deleteValue(key);}catch(_){}
-          status('受け渡し開始を確認できません。ChatGPTタブが開いたか確認してください。自動再送せず、必要ならコピーしてください。');
-        } finally {setTimeout(()=>{busy=false;send.disabled=input.disabled=false;},1200);}
-      };
-      send.addEventListener('click',e=>start(e,'send'));input.addEventListener('click',e=>start(e,'input'));
+          status('ChatGPTタブを開くよう依頼しました。入力・送信を1回だけ進め、不明な結果は自動再送しません。');
+        }catch(err){if(key)try{GM_deleteValue(key);}catch(_){}status('受け渡しを停止しました。'+err.message+' 開いたタブがないか確認してください。');}
+        finally{finish();}
+      });
     }
     setInterval(attach,500);attach();
   }

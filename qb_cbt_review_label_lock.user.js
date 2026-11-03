@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.12-preview.2
-// @description  既存復習パネル＋AI解説の限定抽出プレビュー。実QBの抽出範囲設定が必要な試作版。
+// @version      0.4.12-preview.5
+// @description  既存の解答後判定＋4項目全文照合で1クリックAI解説。条件不一致で停止する実機未確認試作。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
 // @downloadURL  https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -1937,34 +1937,37 @@
     maintainLifecycle();
   }
 
+  // Read-only AI adapter: reuse existing result/UUID evidence, never grading mutation.
+  document.addEventListener('qb-ai-read-existing-context',event=>{
+    const request=event.detail;
+    if(request?.protocol!=='qb-ai-existing-v1')return;
+    const surface=ratingSurface();
+    request.context={q:questionId(),quiz:isQuizPage(),result:hasResultUI(),ratingRoot:surface?.root||null,href:location.href};
+  });
+
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, {once:true});
   else start();
 })();
 
-/* === QB AI explanation: isolated local-preview module (no network / no grading writes) === */
+/* === QB AI explanation: isolated AI module (read-only same-origin API / no grading writes) === */
 (() => {
   'use strict';
   if (location.hostname !== 'cbt.medilink-study.com' || window.__QB_AI_PREVIEW_V1__) return;
   window.__QB_AI_PREVIEW_V1__ = true;
-  const PROFILE_KEY = 'qbAiExplain.selectors.v1';
-  const HOST_ID = 'qb-ai-preview-host';
+  const HOST_ID = 'qb-ai-oneclick-transfer';
   const MAX_TEXT = 60000;
   const FIELDS = [['question','問題文'],['choices','選択肢'],['correctAnswer','正答'],['explanation','公式解説']];
-  // Intentionally NO guessed production selectors. Configure from an authorized DOM inspection.
-  const EMPTY_PROFILE = {root:'',question:'',choices:'',correctAnswer:'',explanation:'',identityAttribute:''};
-  let host, sh, snapshot = null, generation = 0, entryButton;
+  let apiProjection=null,apiProjectionQ='';let snapshot=null, entryButton, transfer, statusNode, busy=false, requestId='';
   const onQuiz = () => /^\/quiz(?:\/|$)/.test(location.pathname);
   const pageKey = () => location.pathname + location.search;
   const clean = value => String(value || '').replace(/\u00a0/g,' ').replace(/[ \t]+/g,' ').replace(/ *\n */g,'\n').replace(/\n{3,}/g,'\n\n').trim();
-  function profile() {
-    try { const p = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
-      return Object.fromEntries(Object.keys(EMPTY_PROFILE).map(k=>[k,typeof p[k] === 'string' ? p[k].trim() : '']));
-    } catch (_) { return {...EMPTY_PROFILE}; }
-  }
   function visible(el) {
     if (!(el instanceof Element) || !el.isConnected || el.closest('[hidden],[aria-hidden="true"],[inert]')) return false;
     for(let n=el;n;n=n.parentElement) {
+      if(n.tagName==='DIALOG'&&!n.open)return false;
+      if(n.tagName==='DETAILS'&&!n.open){const summary=[...n.children].find(child=>child.tagName==='SUMMARY');if(!summary?.contains(el))return false;}
       const s=getComputedStyle(n);
+      if((s.clipPath&&s.clipPath!=='none')||(s.clip&&s.clip!=='auto'&&!/^rect\(auto[, ]+auto[, ]+auto[, ]+auto\)$/.test(s.clip)))return false;
       if(s.display==='none' || s.visibility==='hidden' || s.visibility==='collapse' || s.contentVisibility==='hidden' || Number(s.opacity)===0) return false;
     }
     if(typeof el.checkVisibility==='function' && getComputedStyle(el).display!=='contents' &&
@@ -1980,13 +1983,21 @@
   function visibleText(root) {
     let media=0;
     const walk = node => {
-      if(node.nodeType===Node.TEXT_NODE) return node.textContent;
+      if(node.nodeType===Node.TEXT_NODE) {
+        const parent=node.parentElement;if(!parent||!visible(parent))return '';const style=getComputedStyle(parent);
+        if(parseFloat(style.fontSize)===0||/^(?:transparent|rgba\([^)]*[,/]\s*0(?:\.0+)?\))$/i.test(style.color||'')||style.webkitTextFillColor==='transparent')return '';
+        const range=document.createRange();range.selectNodeContents(node);const rects=[...range.getClientRects()].filter(r=>r.width>0&&r.height>0);if(!rects.length)return '';
+        for(let ancestor=parent;ancestor;ancestor=ancestor.parentElement){const st=getComputedStyle(ancestor);if(/^(hidden|clip)$/.test(st.overflowX||'')||/^(hidden|clip)$/.test(st.overflowY||'')){const clip=ancestor.getBoundingClientRect();if(rects.some(r=>(/^(hidden|clip)$/.test(st.overflowX||'')&&(r.left<clip.left||r.right>clip.right))||(/^(hidden|clip)$/.test(st.overflowY||'')&&(r.top<clip.top||r.bottom>clip.bottom))))return '';}}
+        return node.textContent;
+      }
       if(!(node instanceof Element) || excluded(node)) return '';
       if(node.tagName==='BR') {
         const s=getComputedStyle(node);
         return visible(node.parentElement)&&s.display!=='none'&&s.visibility!=='hidden' ? '\n' : '';
       }
       if(!visible(node)) return '';
+      const imageCSS=style=>/url\s*\(/i.test((style?.backgroundImage||'')+' '+(style?.maskImage||'')+' '+(style?.webkitMaskImage||'')+' '+(style?.content||''));
+      if(imageCSS(getComputedStyle(node))||imageCSS(getComputedStyle(node,'::before'))||imageCSS(getComputedStyle(node,'::after')))media++;
       if(node.matches('img,svg,canvas,video,iframe,object,embed')) { media++; return '\n［画像・図など：未添付］\n'; }
       
       // Never read attributes, links, data URLs, hidden React state, or input values.
@@ -1996,41 +2007,57 @@
     };
     return {text:clean(walk(root)),media};
   }
-  function oneVisible(scope, selector, label) {
-    if(!selector) throw new Error(`${label}の抽出範囲が未設定です。「範囲設定」で確認済みのCSSセレクタを登録してください。`);
-    let matches;
-    try { matches=[...scope.querySelectorAll(selector)].filter(visible); }
-    catch (_) { throw new Error(`${label}のCSSセレクタが正しくありません。`); }
-    if(matches.length!==1) throw new Error(`${label}の表示領域が${matches.length}個見つかりました。1個に限定できないため抽出を止めました。`);
-    const el=matches[0];
-    if(el.matches('html,body,main,#root,#__next') || el.closest(`#${HOST_ID},#qb-cbt-review-label-lock-host,nav,header,footer,aside,[role="dialog"]`))
-      throw new Error(`${label}にページ全体・ナビゲーション・ダイアログは指定できません。`);
-    return el;
+  function existingContext(){
+    const request={protocol:'qb-ai-existing-v1',context:null};
+    document.dispatchEvent(new CustomEvent('qb-ai-read-existing-context',{detail:request}));
+    const ctx=request.context;
+    const ids=new URL(location.href).searchParams.getAll('question_id');
+    if(!ctx||!ctx.quiz||!ctx.result||!ctx.ratingRoot||!visible(ctx.ratingRoot)||ids.length!==1||ctx.q!==ids[0]||ctx.href!==location.href)throw new Error('既存の復習アシストで現在問の解答後画面を確認できません。');
+    if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ctx.q))throw new Error('現在問UUIDを確認できません。');
+    return ctx;
   }
-  function collect() {
-    if(!onQuiz()) throw new Error('問題画面で使用してください。');
-    if([...document.querySelectorAll('button,[role="button"]')].some(el=>visible(el)&&clean(el.textContent)==='解答する'))
-      throw new Error('先にQBで解答し、正答と公式解説を表示してください。');
-    const p=profile(), root=oneVisible(document,p.root,'現在の問題全体');
-    if(p.identityAttribute) {
-      if(!/^(data-[a-z0-9_-]+|id)$/.test(p.identityAttribute)) throw new Error('問題ID属性には data-* または id を指定してください。');
-      const q=new URL(location.href).searchParams.get('question_id');
-      if(!q || root.getAttribute(p.identityAttribute)!==q) throw new Error('画面の問題IDとURLが一致しません。抽出を止めました。');
+  function collect(){
+    if(!apiProjection)throw new Error('現在問の照合データがまだありません。');
+    const ctx=existingContext();
+    if(ctx.q!==apiProjectionQ)throw new Error('API取得中に現在問が変わりました。');
+    const canonical=value=>String(value||'').replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+    const selectors='p,div,section,article,span,li,td,th,h1,h2,h3,h4,h5,h6';
+    const all=[...document.querySelectorAll(selectors)];
+    if(all.length>5000)throw new Error('画面が大きすぎるため自動抽出を止めました。');
+    const candidates=all.filter(node=>!node.matches('html,body,main,#root,#__next')&&!node.closest('button,input,textarea,select,[contenteditable],nav,header,footer,aside,dialog,[role="dialog"],[role="menu"],#qb-cbt-review-label-lock-host')&&visible(node)&&!excluded(node));
+    const cache=new Map();const read=node=>{if(!cache.has(node))cache.set(node,visibleText(node));return cache.get(node);};
+    function unique(text,label,answer=false){
+      const expected=canonical(text);
+      const matches=candidates.filter(node=>(!answer||!node.closest('table,[role="table"]'))&&canonical(read(node).text)===expected);
+      const smallest=matches.filter(node=>!matches.some(other=>node!==other&&node.contains(other)));
+      if(smallest.length!==1)throw new Error(label+'の現在表示を一意に照合できません（'+smallest.length+'候補）。送信しません。');
+      if(read(smallest[0]).media)throw new Error(label+'に画像・図があるため送信しません。');
+      return smallest[0];
     }
-    const elements=FIELDS.map(([k,label])=>oneVisible(root,p[k],label));
-    if(elements.some((el,i)=>elements.some((other,j)=>i!==j&&(el===other||el.contains(other)))))
-      throw new Error('抽出する4領域が重なっています。問題文・選択肢・正答・公式解説を別々の領域にしてください。');
-    const data={}, media=[];
-    FIELDS.forEach(([k,label],i)=>{
-      const value=visibleText(elements[i]);
-      if(!value.text) throw new Error(`${label}が空です。非表示領域やボタン内の内容は読み取りません。`);
-      if(value.text.length>MAX_TEXT) throw new Error(`${label}が長すぎます。抽出範囲が広すぎないか確認してください。`);
-      data[k]=value.text;
-      if(value.media) media.push(`${label}：${value.media}点`);
-    });
-    const prompt=makePrompt(data,media.length>0);
-    if(prompt.length>MAX_TEXT) throw new Error('合計60,000文字を超えています。内容を切り捨てず停止しました。');
-    return {key:pageKey(),data,media,prompt,identityVerified:Boolean(p.identityAttribute),fingerprint:JSON.stringify(data)};
+    const qNode=unique(apiProjection.question,'問題文');
+    const choicesNode=unique(apiProjection.choices,'選択肢');
+    const answerMatches=[];
+    for(const label of ['正解：','正解:','正答：','正答:']){
+      const expected=canonical(label+apiProjection.correctAnswer);
+      for(const node of candidates){if(node.closest('table,[role="table"]'))continue;const text=canonical(read(node).text).replace(/([：:])\s*/g,'$1');if(text===expected&&!answerMatches.includes(node))answerMatches.push(node);}
+    }
+    const answerNodes=answerMatches.filter(node=>!answerMatches.some(other=>node!==other&&node.contains(other)));
+    if(answerNodes.length!==1)throw new Error('現在問の表示済み正答欄を一意に確認できません。履歴の正答は使いません。');
+    const answerNode=answerNodes[0],explanationNode=unique(apiProjection.explanation,'公式解説の全文');
+    const nodes=[qNode,choicesNode,answerNode,explanationNode];
+    if(nodes.some((node,i)=>nodes.some((other,j)=>i!==j&&(node===other||node.contains(other)))))throw new Error('4項目の表示領域が重なっています。');
+    if(nodes.some(node=>ctx.ratingRoot.contains(node)||node.contains(ctx.ratingRoot)))throw new Error('自己評価欄と問題本文の境界が曖昧です。');
+    let root=qNode;
+    while(root&&!nodes.concat(ctx.ratingRoot).every(node=>root.contains(node)))root=root.parentElement;
+    if(!root||root.matches('html,body,main,#root,#__next')||!visible(root))throw new Error('4項目と現在の自己評価欄を同じ問題領域に結び付けられません。');
+    // Scan media only, not text, in the bounded current-question ancestor.
+    const imageCSS=style=>/url\s*\(/i.test((style?.backgroundImage||'')+' '+(style?.maskImage||'')+' '+(style?.webkitMaskImage||'')+' '+(style?.content||''));
+    const visual=[root,...root.querySelectorAll('*')];
+    if(visual.some(node=>!ctx.ratingRoot.contains(node)&&visible(node)&&(node.matches('img,svg,canvas,video,audio,iframe,object,embed')||imageCSS(getComputedStyle(node))||imageCSS(getComputedStyle(node,'::before'))||imageCSS(getComputedStyle(node,'::after')))))throw new Error('現在問の領域に画像・図・音声があるため送信しません。');
+    const data={question:read(qNode).text,choices:read(choicesNode).text,correctAnswer:read(answerNode).text,explanation:read(explanationNode).text};
+    const result={key:pageKey(),data,media:[],prompt:makePrompt(data,false),identityVerified:true,fingerprint:JSON.stringify(data),profileFingerprint:'existing-gate-v1:'+ctx.q,nodes:[root,...nodes,ctx.ratingRoot]};
+    if(result.prompt.length>MAX_TEXT)throw new Error('依頼文が60,000文字を超えています。');
+    qbCheckRenderedApi(result,apiProjection);return result;
   }
   function makePrompt(data,hasMedia) {
     return '医学CBTの学習用に、以下の1問を日本語で解説してください。\n'+
@@ -2039,113 +2066,137 @@
       (hasMedia?'画像・図は添付されていません。画像所見を推測せず、必要なら追加を求めてください。\n':'')+
       '\n【問題文】\n'+data.question+'\n\n【選択肢】\n'+data.choices+'\n\n【正答】\n'+data.correctAnswer+'\n\n【公式解説】\n'+data.explanation;
   }
-  function invalidate(message) {
-    generation++; snapshot=null;
-    if(sh) {sh.getElementById('approved').checked=false;sh.getElementById('qb-ai-prompt').value='';sh.getElementById('message').textContent=message||'';}
-  }
-  function currentSnapshot() {
-    if(!snapshot) throw new Error('「AI解説」で現在の問題を再抽出してください。');
-    const now=collect();
-    if(now.key!==snapshot.key || now.fingerprint!==snapshot.fingerprint || sh.getElementById('qb-ai-prompt').value!==snapshot.prompt) {
-      invalidate('問題や解説の表示が変わりました。「AI解説」で再抽出してください。');
-      throw new Error('表示内容が変わったため、古い内容は渡しません。');
+/* Current-question API allowlist. No full response, IDs, URLs, rates or history enter the prompt. */
+function qbApiText(html) {
+  if(typeof html!=='string'||html.length>60000)throw new Error('APIの本文形式が未対応です。');
+  if(/<!|<\?|\b(?:src|srcset|poster)\s*=|url\s*\(|(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|opacity\s*:\s*0(?:\D|$)|content-visibility\s*:\s*hidden|font-size\s*:\s*0(?:\D|$))|\bhidden(?:\s|=|>)/i.test(html))throw new Error('API本文に画像・非表示指定・未対応マークアップがあります。');
+  const allowed=new Set(['p','div','span','b','strong','i','em','u','s','sub','sup','br','table','thead','tbody','tfoot','tr','td','th','ul','ol','li','a']);
+  // Strip every attribute BEFORE inert parsing so resource URLs/events are never installed.
+  let covered='';const sanitized=html.replace(/<\s*(\/?)\s*([a-z][\w:-]*)\b[^>]*>/gi,(whole,close,tag)=>{
+    if(!allowed.has(tag.toLowerCase()))throw new Error('API本文に画像・図・未対応タグがあります。');
+    covered+=whole;return '<'+close+tag.toLowerCase()+'>';
+  });
+  if(/<\s*\/?\s*[a-z]/i.test(sanitized.replace(/<\/?(?:p|div|span|b|strong|i|em|u|s|sub|sup|br|table|thead|tbody|tfoot|tr|td|th|ul|ol|li|a)>/gi,'')))throw new Error('API本文のHTML構造が不明です。');
+  const doc=new DOMParser().parseFromString(sanitized,'text/html');
+  const walk=node=>{
+    if(node.nodeType===3)return node.textContent;
+    if(node.nodeType!==1)return '';
+    if(node.tagName==='BR')return '\n';
+    const text=[...node.childNodes].map(walk).join('');
+    if(/^(TD|TH)$/.test(node.tagName))return text+'\t';
+    return /^(P|DIV|LI|TR|UL|OL|TABLE)$/.test(node.tagName)?'\n'+text+'\n':text;
+  };
+  return walk(doc.body).replace(/\u00a0/g,' ').replace(/[ \t]+/g,' ').replace(/ *\n */g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+}
+function qbProjectApi(raw,q,parse=qbApiText) {
+  const isObject=v=>Boolean(v)&&typeof v==='object'&&!Array.isArray(v);
+  if(!isObject(raw)||raw.question_id!==q)throw new Error('APIの問題IDが現在問と一致しません。');
+  if(raw.kind!=='single'||typeof raw.pre_body!=='string'||raw.pre_body.trim()!==''||!Array.isArray(raw.series)||raw.series.length)throw new Error('連問・前文・未対応の問題種別は自動送信しません。');
+  const question=parse(raw.body);if(!question)throw new Error('APIの問題文が空です。');
+  if(!isObject(raw.options))throw new Error('APIの選択肢形式が未対応です。');
+  const labels=Object.keys(raw.options).sort();
+  if(labels.length<2||labels.length>26||labels.some((key,i)=>key!==String.fromCharCode(97+i)))throw new Error('選択肢記号が連続せず、構造を確定できません。');
+  const choices=labels.map(key=>{const text=parse(raw.options[key]);if(!text)throw new Error('空の選択肢・画像主体の問題は自動送信しません。');return {label:key,text};});
+  if(!Array.isArray(raw.correct_answers)||raw.correct_answers.length!==1||!Array.isArray(raw.correct_answers[0])||raw.correct_answers[0].length!==1||!labels.includes(raw.correct_answers[0][0]))throw new Error('複数正答・曖昧な正答形式は未対応です。');
+  if(!Array.isArray(raw.boxes))throw new Error('APIの解説形式が未対応です。');
+  const boxes=raw.boxes.filter(box=>isObject(box)&&box.description_code==='DESCRIPTION');
+  if(boxes.length!==1||boxes[0].box_title!=='解説'||!Array.isArray(boxes[0].box_contents)||!boxes[0].box_contents.length)throw new Error('公式解説の箱を一意に確認できません。');
+  const parts=[];let leaves=0;
+  const heading=value=>{if(value===null||value===undefined||value==='')return;const text=parse(value);if(text)parts.push(text);};
+  for(const section of boxes[0].box_contents){
+    if(!isObject(section)||!Array.isArray(section.sub_contents)||!section.sub_contents.length)throw new Error('公式解説の節が未対応です。');
+    heading(section.sub_title);
+    for(const sub of section.sub_contents){
+      if(!isObject(sub)||!Array.isArray(sub.detail_contents)||!sub.detail_contents.length)throw new Error('公式解説の詳細が未対応です。');
+      heading(sub.detail_title);
+      for(const detail of sub.detail_contents){
+        if(!isObject(detail))throw new Error('公式解説の本文が未対応です。');
+        const text=parse(detail.text);if(!text)throw new Error('公式解説の本文が空です。');parts.push(text);leaves++;
+        // reference_links intentionally ignored; never resolve or include URLs.
+      }
     }
+  }
+  if(!leaves)throw new Error('公式解説を確認できません。');
+  const data={question,choices:choices.map(c=>c.label+' '+c.text).join('\n'),correctAnswer:raw.correct_answers[0][0],explanation:parts.join('\n')};
+  if(Object.values(data).some(s=>s.length>60000))throw new Error('APIの4項目が長すぎます。');
+  return Object.freeze(data);
+}
+function qbCheckRenderedApi(rendered,projected) {
+  const canonical=text=>String(text).replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+  if(!rendered?.identityVerified)throw new Error('現在問の可視DOMとID対応が未確認です。');
+  for(const key of ['question','choices','explanation'])if(canonical(rendered.data[key])!==canonical(projected[key]))throw new Error('現在表示されている'+({question:'問題文',choices:'選択肢',explanation:'公式解説'}[key])+'とAPIの全文が一致しません。未表示部分は送信しません。');
+  const answer=/^(?:正解|正答)\s*[:：]\s*([a-z])$/i.exec(canonical(rendered.data.correctAnswer));
+  if(!answer||answer[1].toLowerCase()!==projected.correctAnswer)throw new Error('現在問の表示済み正答を確認できません。');
+  // Return only the already-rendered DOM fields. API-only text is never the outgoing payload.
+  return rendered;
+}
+async function qbReadCurrentApi(q,fetcher=window.fetch.bind(window)) {
+  if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(q))throw new Error('現在問のUUIDを確定できません。');
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),5000);
+  try{
+    const response=await fetcher('/api/questions/'+encodeURIComponent(q),{method:'GET',credentials:'same-origin',cache:'no-store',headers:{Accept:'application/json'},signal:controller.signal});
+    if(!response.ok)throw new Error('現在問の既存API取得に失敗しました。');
+    return qbProjectApi(await response.json(),q);
+  }finally{clearTimeout(timer);}
+}
+
+  const newId=()=>[...crypto.getRandomValues(new Uint8Array(16))].map(n=>n.toString(16).padStart(2,'0')).join('');
+  function say(message){if(statusNode)statusNode.textContent=message;}
+  function invalidate(message){
+    apiProjection=null;apiProjectionQ='';snapshot=null;requestId='';busy=false;if(entryButton)entryButton.disabled=false;
+    if(transfer){transfer.textContent='';transfer.dataset.state='error';transfer.dataset.requestId='';}
+    if(message)say(message);
+  }
+  function currentSnapshot(){
+    if(!snapshot||!transfer||transfer.dataset.state!=='ready'||transfer.dataset.requestId!==requestId)throw new Error('現在の受け渡しが準備できていません。');
+    const current=collect();qbCheckRenderedApi(current,apiProjection);
+    if(current.key!==snapshot.key||current.fingerprint!==snapshot.fingerprint||current.profileFingerprint!==snapshot.profileFingerprint||current.nodes.some((n,i)=>n!==snapshot.nodes[i])||transfer.textContent!==snapshot.prompt){invalidate('問題の表示が変わったため送信を止めました。');throw new Error('問題または受け渡し内容が変わりました。');}
+    if(Date.now()-Number(transfer.dataset.createdAt)>15000){invalidate('受け渡しの待機期限が切れました。');throw new Error('受け渡しの待機期限が切れました。');}
     return snapshot;
   }
-  function status(message) {sh.getElementById('message').textContent=message;}
-  function close() {invalidate();host.hidden=true;entryButton?.focus();}
-  function ensureModal() {
-    if(host?.isConnected) return;
-    host=document.createElement('div');host.id=HOST_ID;host.hidden=true;
-    host.style.cssText='position:fixed;inset:0;z-index:2147483640;background:#0f172a77;';
-    sh=host.attachShadow({mode:'open'});
-    sh.innerHTML=`<style>
-      :host{font:14px/1.5 system-ui,sans-serif;color:#172033}*{box-sizing:border-box}[hidden]{display:none!important}
-      section{background:white;margin:4vh auto;padding:20px;border-radius:14px;width:min(820px,94vw);max-height:92vh;overflow:auto;box-shadow:0 20px 65px #0005}
-      h2{font-size:19px;margin:0 0 8px}p{margin:8px 0}button{font:inherit;padding:8px 12px;border:1px solid #94a3b8;border-radius:8px;background:#fff;color:#172033;cursor:pointer}button:disabled{opacity:.5;cursor:default}
-      textarea,input[type=text]{font:13px/1.5 ui-monospace,monospace;width:100%;border:1px solid #94a3b8;border-radius:6px;padding:8px}textarea{min-height:270px;resize:vertical}
-      label{display:block;margin:8px 0}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1}.muted{font-size:12px;color:#475569}.warn{color:#854d0e;background:#fffbeb;padding:8px;border-radius:6px}
-      #message{white-space:pre-wrap;min-height:20px}a{color:#1d4ed8}summary{cursor:pointer}input[type=checkbox]{margin-right:6px}
-    </style><section role="dialog" aria-modal="true" aria-labelledby="heading">
-      <div class="row"><h2 id="heading" class="grow">AI解説・渡す内容の確認</h2><button id="close" type="button">閉じる</button></div>
-      <p class="muted">抽出元は現在表示されている4領域だけです。氏名・成績・メモなどが混ざっていないことと、現在の問題であることを確認してください。</p>
-      <p id="warnings" class="warn" hidden></p><p id="message" role="status" aria-live="polite"></p>
-      <textarea id="qb-ai-prompt" aria-label="ChatGPTに渡す依頼文" readonly spellcheck="false"></textarea>
-      <label><input id="approved" type="checkbox">上の内容をChatGPT（OpenAI）へ渡すことに同意します。「解説を開始」は自動送信します。画像・図は自動添付されません。入力だけでもChatGPT側から内容を参照できます。</label>
-      <div class="row" id="qb-ai-transfer-actions"><button id="copy" type="button">依頼文をコピー</button><a id="open-chatgpt" href="https://chatgpt.com/" target="_blank" rel="noopener noreferrer">ChatGPTを開く</a></div>
-      <p class="muted" id="bridge-note">自動入力には同梱の「QB AI解説ブリッジ」が必要です。ブリッジなしの場合はコピーしてChatGPTに貼り付けてください。ブリッジの「解説を開始」は自動送信、「入力だけ」は送信しません。</p>
-      <details id="settings"><summary>抽出範囲の設定（初回・画面変更時）</summary><p class="muted">実QBのDOMは未検証です。セレクタは推測せず未設定にしています。許可された画面確認で、現在問の親領域とその中の4領域を指定してください。本文の入力欄は読み取り専用です。</p>
-        <div id="selector-fields"></div><button id="save-profile" type="button">範囲設定を保存</button>
-      </details>
-    </section>`;
-    document.body.append(host);
-    for(const [key,label] of [['root','現在の問題全体'],...FIELDS,['identityAttribute','問題ID属性（任意。data-question-id など）']]) {
-      const row=document.createElement('label');row.textContent=label;
-      const input=document.createElement('input');input.type='text';input.dataset.profileKey=key;input.value=profile()[key];
-      row.append(input);sh.getElementById('selector-fields').append(row);
-    }
-    sh.getElementById('close').onclick=close;
-    sh.addEventListener('keydown',e=>{
-      if(e.key==='Escape'){e.preventDefault();close();}
-      if(e.key==='Tab') {
-        const nodes=[...sh.querySelectorAll('button,input,textarea,a,summary')].filter(el=>!el.disabled&&el.getClientRects().length);
-        const first=nodes[0], last=nodes.at(-1);
-        if(e.shiftKey&&sh.activeElement===first){e.preventDefault();last.focus();}
-        else if(!e.shiftKey&&sh.activeElement===last){e.preventDefault();first.focus();}
-      }
-    });
-    sh.getElementById('save-profile').onclick=()=>{
-      const next=Object.fromEntries([...sh.querySelectorAll('[data-profile-key]')].map(el=>[el.dataset.profileKey,el.value.trim()]));
-      try {localStorage.setItem(PROFILE_KEY,JSON.stringify(next));invalidate('範囲設定を保存しました。閉じて「AI解説」を押すと再抽出します。');}
-      catch(_){status('範囲設定を保存できませんでした。ブラウザの保存制限を確認してください。');}
-    };
-    sh.getElementById('copy').onclick=async e=>{
-      if(!e.isTrusted) return;
-      try {
-        currentSnapshot();
-        const text=sh.getElementById('qb-ai-prompt').value;
-        if(!text) throw new Error('コピーする内容がありません。');
-        await navigator.clipboard.writeText(text);
-        status('コピーしました。ChatGPTに貼り付けて、内容を確認して送信してください。');
-      } catch(err){status(err.message+' コピーできない場合は依頼文を選択し、Ctrl+C / ⌘C でコピーできます。');}
-    };
-    // Bridge revalidates the approved snapshot synchronously, before it reads the preview.
-    host.addEventListener('qb-ai-before-transfer',e=>{
-      try {currentSnapshot();if(!sh.getElementById('approved').checked)throw new Error('先に内容を確認し、同意欄にチェックしてください。');}
-      catch(err){e.preventDefault();status(err.message);}
-    });
+  function validateTransfer(e){
+    transfer.dataset.validatedRequest='';
+    try{currentSnapshot();transfer.dataset.validatedRequest=requestId;}catch(err){e.preventDefault();say(err.message);}
   }
-  async function openPreview(e) {
-    if(!e.isTrusted) return;
-    ensureModal();invalidate();host.hidden=false;sh.getElementById('close').focus();
-    const token=generation;
-    try {
-      const first=collect();status('表示内容が安定しているか確認中…');
+  function finishTransfer(){apiProjection=null;apiProjectionQ='';snapshot=null;requestId='';busy=false;entryButton.disabled=false;transfer.textContent='';}
+  async function oneClick(e){
+    if(!e.isTrusted||busy)return;
+    if(entryButton.dataset.qbAiBridge!=='oneclick-v1'){say('1クリック用ブリッジが見つかりません。対応する2本の試作を有効にしてください。');return;}
+    busy=true;entryButton.disabled=true;snapshot=null;requestId=newId();
+    const id=requestId;
+    transfer.dataset.requestId=id;transfer.dataset.createdAt=String(Date.now());transfer.dataset.state='reading';transfer.dataset.action='send';transfer.textContent='';
+    say('現在の1問を確認しています…');
+    try{
+      const before=existingContext(),q=before.q;
+      const projected=await qbReadCurrentApi(q);
+      if(requestId!==id)return;
+      const after=existingContext();if(before.q!==after.q||before.href!==after.href||before.ratingRoot!==after.ratingRoot)throw new Error('取得中に解答後の画面が変わりました。');
+      apiProjection=projected;apiProjectionQ=q;
+      const first=collect();
       await new Promise(resolve=>setTimeout(resolve,250));
-      if(token!==generation||host.hidden) return;
-      const second=collect();
-      if(first.key!==second.key||first.fingerprint!==second.fingerprint) throw new Error('問題の切り替え中です。表示が落ち着いてから再度押してください。');
-      snapshot=second;
-      sh.getElementById('qb-ai-prompt').value=second.prompt;
-      const warnings=[];
-      if(!second.identityVerified)warnings.push('問題IDのDOM照合は未設定です。表示内容が現在の問題か確認してください。');
-      if(second.media.length)warnings.push(`画像・図などは未添付（${second.media.join('、')}）。必要な画像はChatGPTに手動で添付してください。`);
-      sh.getElementById('warnings').textContent=warnings.join('\n');sh.getElementById('warnings').hidden=!warnings.length;
-      status(`${second.prompt.length.toLocaleString()}文字。外部にはまだ渡していません。`);
-    } catch(err){status(err.message);sh.getElementById('settings').open=true;}
+      if(requestId!==id)return;
+      const next=collect();qbCheckRenderedApi(next,projected);if(first.key!==next.key||first.fingerprint!==next.fingerprint||first.profileFingerprint!==next.profileFingerprint||first.nodes.some((n,i)=>n!==next.nodes[i]))throw new Error('問題の切り替え中です。表示が落ち着いてから押してください。');
+      snapshot=next;transfer.textContent=next.prompt;transfer.dataset.state='ready';
+      say('4項目を確認しました。ChatGPTへ渡しています…');
+      setTimeout(()=>{if(requestId===id&&transfer.dataset.state!=='consumed')invalidate('受け渡しが完了しませんでした。ブリッジの有効状態を確認してください。');},15000);
+    }catch(err){if(requestId===id)invalidate(err.message);}
   }
-  function mountButton() {
+  function mountButton(){
     const panel=document.getElementById('qb-cbt-review-label-lock-host')?.shadowRoot;
     const main=panel?.getElementById('main');
-    if(!main || !onQuiz()) {if(host&&!host.hidden)close();return;}
-    if(!main.querySelector('#qb-ai-explain')) {
+    if(!main||!onQuiz()){if(snapshot||busy)invalidate('問題画面を離れたため送信を止めました。');return;}
+    if(!main.querySelector('#qb-ai-explain')){
       const row=document.createElement('div');row.style.cssText='margin-top:10px;padding-top:9px;border-top:1px solid #e2e8f0';
-      entryButton=document.createElement('button');entryButton.id='qb-ai-explain';entryButton.type='button';entryButton.textContent='AI解説';entryButton.style.width='100%';entryButton.title='現在の問題・選択肢・正答・公式解説だけを確認してChatGPTへ';
-      entryButton.addEventListener('click',openPreview);row.append(entryButton);main.append(row);
+      entryButton=document.createElement('button');entryButton.id='qb-ai-explain';entryButton.type='button';entryButton.textContent='AI解説';entryButton.style.width='100%';entryButton.title='現在の問題・選択肢・正答・公式解説をChatGPTへ自動入力・送信';
+      const hint=document.createElement('p');hint.className='small';hint.textContent='1クリックで現在の1問をChatGPTへ入力・送信。画像や読取不明時は停止します。';
+      statusNode=document.createElement('p');statusNode.id='qb-ai-oneclick-status';statusNode.className='small';statusNode.setAttribute('role','status');statusNode.setAttribute('aria-live','polite');
+      transfer=document.createElement('div');transfer.id=HOST_ID;transfer.hidden=true;transfer.dataset.state='idle';
+      transfer.addEventListener('qb-ai-before-transfer',validateTransfer);
+      transfer.addEventListener('qb-ai-transfer-finished',finishTransfer);
+      entryButton.addEventListener('click',oneClick);row.append(entryButton,hint,statusNode,transfer);main.append(row);
     }
-    if(snapshot&&pageKey()!==snapshot.key)invalidate('別の問題に移動しました。「AI解説」で再抽出してください。');
+    if(snapshot&&pageKey()!==snapshot.key)invalidate('別の問題に移動したため受け渡しを止めました。');
   }
-  window.addEventListener('pagehide',()=>{if(host)close();});
-  window.addEventListener('popstate',mountButton);
+  window.addEventListener('pagehide',()=>invalidate());window.addEventListener('popstate',mountButton);
   setInterval(mountButton,500);mountButton();
 })();
