@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.12-preview.5
+// @version      0.4.12-preview.6
 // @description  既存の解答後判定＋4項目全文照合で1クリックAI解説。条件不一致で停止する実機未確認試作。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -1979,8 +1979,8 @@
     }
     return false;
   }
-  const excluded = el => el.isContentEditable || el.matches('script,style,noscript,template,input,textarea,select,button,nav,header,footer,aside,[contenteditable="true"]') || el.id === HOST_ID || el.id === 'qb-cbt-review-label-lock-host';
-  function visibleText(root) {
+  const excluded = (el,choiceButtons=false) => el.isContentEditable || (!choiceButtons&&el.tagName==='BUTTON') || el.matches('script,style,noscript,template,input,textarea,select,nav,header,footer,aside,[contenteditable="true"]') || el.id === HOST_ID || el.id === 'qb-cbt-review-label-lock-host';
+  function visibleText(root, choiceButtons=false, skipNodes=[]) {
     let media=0;
     const walk = node => {
       if(node.nodeType===Node.TEXT_NODE) {
@@ -1990,7 +1990,8 @@
         for(let ancestor=parent;ancestor;ancestor=ancestor.parentElement){const st=getComputedStyle(ancestor);if(/^(hidden|clip)$/.test(st.overflowX||'')||/^(hidden|clip)$/.test(st.overflowY||'')){const clip=ancestor.getBoundingClientRect();if(rects.some(r=>(/^(hidden|clip)$/.test(st.overflowX||'')&&(r.left<clip.left||r.right>clip.right))||(/^(hidden|clip)$/.test(st.overflowY||'')&&(r.top<clip.top||r.bottom>clip.bottom))))return '';}}
         return node.textContent;
       }
-      if(!(node instanceof Element) || excluded(node)) return '';
+      if(!(node instanceof Element) || skipNodes.includes(node) || excluded(node,choiceButtons)) return '';
+      if(choiceButtons&&node.matches('[contenteditable],dialog,[role="dialog"],[role="menu"]'))return '';
       if(node.tagName==='BR') {
         const s=getComputedStyle(node);
         return visible(node.parentElement)&&s.display!=='none'&&s.visibility!=='hidden' ? '\n' : '';
@@ -2035,7 +2036,6 @@
       return smallest[0];
     }
     const qNode=unique(apiProjection.question,'問題文');
-    const choicesNode=unique(apiProjection.choices,'選択肢');
     const answerMatches=[];
     for(const label of ['正解：','正解:','正答：','正答:']){
       const expected=canonical(label+apiProjection.correctAnswer);
@@ -2044,6 +2044,12 @@
     const answerNodes=answerMatches.filter(node=>!answerMatches.some(other=>node!==other&&node.contains(other)));
     if(answerNodes.length!==1)throw new Error('現在問の表示済み正答欄を一意に確認できません。履歴の正答は使いません。');
     const answerNode=answerNodes[0],explanationNode=unique(apiProjection.explanation,'公式解説の全文');
+    const anchors=[qNode,answerNode,explanationNode,ctx.ratingRoot];
+    let anchorRoot=qNode;
+    while(anchorRoot&&!anchors.every(node=>anchorRoot.contains(node)))anchorRoot=anchorRoot.parentElement;
+    if(!anchorRoot||anchorRoot.matches('html,body,main,#root,#__next')||!visible(anchorRoot))throw new Error('現在問の表示領域を限定できません。');
+    const choiceMatch=matchChoices(anchorRoot,anchors,apiProjection,canonical);
+    const choicesNode=choiceMatch.root;
     const nodes=[qNode,choicesNode,answerNode,explanationNode];
     if(nodes.some((node,i)=>nodes.some((other,j)=>i!==j&&(node===other||node.contains(other)))))throw new Error('4項目の表示領域が重なっています。');
     if(nodes.some(node=>ctx.ratingRoot.contains(node)||node.contains(ctx.ratingRoot)))throw new Error('自己評価欄と問題本文の境界が曖昧です。');
@@ -2054,11 +2060,72 @@
     const imageCSS=style=>/url\s*\(/i.test((style?.backgroundImage||'')+' '+(style?.maskImage||'')+' '+(style?.webkitMaskImage||'')+' '+(style?.content||''));
     const visual=[root,...root.querySelectorAll('*')];
     if(visual.some(node=>!ctx.ratingRoot.contains(node)&&visible(node)&&(node.matches('img,svg,canvas,video,audio,iframe,object,embed')||imageCSS(getComputedStyle(node))||imageCSS(getComputedStyle(node,'::before'))||imageCSS(getComputedStyle(node,'::after')))))throw new Error('現在問の領域に画像・図・音声があるため送信しません。');
-    const data={question:read(qNode).text,choices:read(choicesNode).text,correctAnswer:read(answerNode).text,explanation:read(explanationNode).text};
-    const result={key:pageKey(),data,media:[],prompt:makePrompt(data,false),identityVerified:true,fingerprint:JSON.stringify(data),profileFingerprint:'existing-gate-v1:'+ctx.q,nodes:[root,...nodes,ctx.ratingRoot]};
+    const data={question:read(qNode).text,choices:choiceMatch.text,correctAnswer:read(answerNode).text,explanation:read(explanationNode).text};
+    const result={key:pageKey(),data,media:[],prompt:makePrompt(data,false),identityVerified:true,fingerprint:JSON.stringify(data),profileFingerprint:'existing-gate-v1:'+ctx.q,nodes:[root,...nodes,ctx.ratingRoot,...choiceMatch.evidence]};
     if(result.prompt.length>MAX_TEXT)throw new Error('依頼文が60,000文字を超えています。');
     qbCheckRenderedApi(result,apiProjection);return result;
   }
+
+  function matchChoices(root,anchors,projection,canonical) {
+    // Only this read-only matcher may inspect button-rendered option text.
+    // It never reads input values, attributes, page state, or control actions.
+    const blocked='input,textarea,select,[contenteditable],nav,header,footer,aside,dialog,[role="dialog"],[role="menu"],#qb-cbt-review-label-lock-host';
+    const unsafe='textarea,select,[contenteditable],nav,header,footer,aside,dialog,[role="dialog"],[role="menu"],#qb-cbt-review-label-lock-host';
+    const hasUnsafe=group=>[group,...group.querySelectorAll(unsafe)].some(node=>visible(node)&&(node.isContentEditable||node.matches(unsafe)));
+    const tags='p,div,section,article,span,li,td,th,label,ul,ol,fieldset,button';
+    const all=[root,...root.querySelectorAll(tags)].filter(node=>visible(node)&&!node.isContentEditable&&!node.closest(blocked)&&!anchors.some(anchor=>anchor.contains(node)||node.contains(anchor)));
+    if(all.length>2000)throw new Error('選択肢の候補領域が大きすぎます。');
+    const cache=new Map();const read=node=>{if(!cache.has(node))cache.set(node,visibleText(node,true));return cache.get(node);};
+    const smallest=nodes=>nodes.filter(node=>!nodes.some(other=>other!==node&&node.contains(other)));
+    const full=smallest(all.filter(node=>canonical(read(node).text)===canonical(projection.choices)));
+    if(full.length>1)throw new Error('選択肢全体の表示が複数あるため送信しません。');
+    const items=projection.choiceItems;
+    if(!Array.isArray(items)||items.length<2)throw new Error('選択肢の照合構造がありません。');
+    function row(node,item) {
+      const text=canonical(read(node).text);
+      const decorated=/^(?:([a-z])(?:[.):：]\s*|\s+)|\(([a-z])\)\s*)([\s\S]+)$/.exec(text);
+      if(decorated&&(decorated[1]||decorated[2])===item.label&&canonical(decorated[3])===canonical(item.text))return {node,label:decorated[1]||decorated[2],text:decorated[3],evidence:[node]};
+      // Adjacent inline spans can have no text-space. Permit that only when
+      // a visible label and the complete visible body are separate DOM nodes.
+      const descendants=all.filter(n=>n!==node&&node.contains(n));
+      const labelPattern=/^(?:([a-z])[.):：]?|\(([a-z])\))$/;
+      const labels=smallest(descendants.filter(n=>{const m=labelPattern.exec(canonical(read(n).text));return m&&(m[1]||m[2])===item.label;}));
+      const bodies=smallest(descendants.filter(n=>canonical(read(n).text)===canonical(item.text)));
+      if(labels.length!==1||bodies.length!==1||labels[0]===bodies[0]||labels[0].contains(bodies[0])||bodies[0].contains(labels[0]))return null;
+      if(!(labels[0].compareDocumentPosition(bodies[0])&Node.DOCUMENT_POSITION_FOLLOWING))return null;
+      if(canonical(visibleText(node,true,[labels[0],bodies[0]]).text))return null;
+      const m=labelPattern.exec(canonical(read(labels[0]).text));
+      return {node,label:m[1]||m[2],text:read(bodies[0]).text,evidence:[node,labels[0],bodies[0]]};
+    }
+    const sets=items.map(item=>{
+      const found=all.map(node=>row(node,item)).filter(Boolean);
+      return found.filter(x=>!found.some(y=>x.node!==y.node&&x.node.contains(y.node)));
+    });
+    if(sets.some(set=>set.length>1))throw new Error('同じ記号・本文の選択肢が複数あり、現在表示を一意に照合できません。');
+    let grouped=null;
+    if(sets.every(set=>set.length===1)) {
+      const rows=sets.map(set=>set[0]),nodes=rows.map(x=>x.node);
+      if(nodes.some((node,i)=>nodes.some((other,j)=>i!==j&&(node===other||node.contains(other)))))throw new Error('選択肢の表示領域が重なっています。');
+      if(nodes.some((node,i)=>i&&!(nodes[i-1].compareDocumentPosition(node)&Node.DOCUMENT_POSITION_FOLLOWING)))throw new Error('選択肢の表示順が一致しません。');
+      let group=nodes[0];while(group&&!nodes.every(node=>group.contains(node)))group=group.parentElement;
+      if(!group||!root.contains(group)||anchors.some(n=>group.contains(n)||n.contains(group)))throw new Error('選択肢を独立した同一領域に結び付けられません。');
+      if(hasUnsafe(group))throw new Error('選択肢の領域に編集欄・別メニューが含まれています。');
+      if(canonical(visibleText(group,true,nodes).text))throw new Error('選択肢の領域に未照合の表示があります。送信しません。');
+      if(read(group).media)throw new Error('選択肢に画像・図があるため送信しません。');
+      grouped={root:group,text:rows.map(x=>x.label+' '+x.text).join('\n'),evidence:rows.flatMap(x=>x.evidence)};
+    }
+    if(full.length===1){
+      if(grouped&&!full[0].contains(grouped.root)&&!grouped.root.contains(full[0]))throw new Error('別の選択肢領域が重複しています。');
+      if(grouped)return grouped;
+      if(hasUnsafe(full[0]))throw new Error('選択肢の領域に編集欄・別メニューが含まれています。');
+      if(read(full[0]).media)throw new Error('選択肢に画像・図があるため送信しません。');
+      return {root:full[0],text:read(full[0]).text,evidence:[]};
+    }
+    if(grouped)return grouped;
+    const matched=sets.filter(set=>set.length===1).length;
+    throw new Error('選択肢の記号と本文を全件照合できません（'+matched+'/'+items.length+'件）。送信しません。');
+  }
+
   function makePrompt(data,hasMedia) {
     return '医学CBTの学習用に、以下の1問を日本語で解説してください。\n'+
       '結論、重要な手掛かり、正答の理由、各誤答選択肢が違う理由、試験用の短い覚え方の順に説明してください。\n'+
@@ -2119,6 +2186,7 @@ function qbProjectApi(raw,q,parse=qbApiText) {
   if(!leaves)throw new Error('公式解説を確認できません。');
   const data={question,choices:choices.map(c=>c.label+' '+c.text).join('\n'),correctAnswer:raw.correct_answers[0][0],explanation:parts.join('\n')};
   if(Object.values(data).some(s=>s.length>60000))throw new Error('APIの4項目が長すぎます。');
+  Object.defineProperty(data,'choiceItems',{value:Object.freeze(choices.map(c=>Object.freeze({...c})))});
   return Object.freeze(data);
 }
 function qbCheckRenderedApi(rendered,projected) {
@@ -2150,7 +2218,7 @@ async function qbReadCurrentApi(q,fetcher=window.fetch.bind(window)) {
   function currentSnapshot(){
     if(!snapshot||!transfer||transfer.dataset.state!=='ready'||transfer.dataset.requestId!==requestId)throw new Error('現在の受け渡しが準備できていません。');
     const current=collect();qbCheckRenderedApi(current,apiProjection);
-    if(current.key!==snapshot.key||current.fingerprint!==snapshot.fingerprint||current.profileFingerprint!==snapshot.profileFingerprint||current.nodes.some((n,i)=>n!==snapshot.nodes[i])||transfer.textContent!==snapshot.prompt){invalidate('問題の表示が変わったため送信を止めました。');throw new Error('問題または受け渡し内容が変わりました。');}
+    if(current.key!==snapshot.key||current.fingerprint!==snapshot.fingerprint||current.profileFingerprint!==snapshot.profileFingerprint||current.nodes.length!==snapshot.nodes.length||current.nodes.some((n,i)=>n!==snapshot.nodes[i])||transfer.textContent!==snapshot.prompt){invalidate('問題の表示が変わったため送信を止めました。');throw new Error('問題または受け渡し内容が変わりました。');}
     if(Date.now()-Number(transfer.dataset.createdAt)>15000){invalidate('受け渡しの待機期限が切れました。');throw new Error('受け渡しの待機期限が切れました。');}
     return snapshot;
   }
@@ -2175,7 +2243,7 @@ async function qbReadCurrentApi(q,fetcher=window.fetch.bind(window)) {
       const first=collect();
       await new Promise(resolve=>setTimeout(resolve,250));
       if(requestId!==id)return;
-      const next=collect();qbCheckRenderedApi(next,projected);if(first.key!==next.key||first.fingerprint!==next.fingerprint||first.profileFingerprint!==next.profileFingerprint||first.nodes.some((n,i)=>n!==next.nodes[i]))throw new Error('問題の切り替え中です。表示が落ち着いてから押してください。');
+      const next=collect();qbCheckRenderedApi(next,projected);if(first.key!==next.key||first.fingerprint!==next.fingerprint||first.profileFingerprint!==next.profileFingerprint||first.nodes.length!==next.nodes.length||first.nodes.some((n,i)=>n!==next.nodes[i]))throw new Error('問題の切り替え中です。表示が落ち着いてから押してください。');
       snapshot=next;transfer.textContent=next.prompt;transfer.dataset.state='ready';
       say('4項目を確認しました。ChatGPTへ渡しています…');
       setTimeout(()=>{if(requestId===id&&transfer.dataset.state!=='consumed')invalidate('受け渡しが完了しませんでした。ブリッジの有効状態を確認してください。');},15000);
