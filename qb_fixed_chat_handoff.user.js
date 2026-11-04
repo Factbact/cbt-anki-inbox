@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QB 指定ChatGPT入力（独立・未検証実験）
 // @namespace    https://local.tools/qb-fixed-chat-handoff
-// @version      0.1.0-experimental.2
+// @version      0.1.0-experimental.3
 // @description  自分で指定した既存のChatGPT会話だけに現在の1問を入力。送信・タブ作成なし。実画面では未検証。
 // @match        https://cbt.medilink-study.com/*
 // @match        https://chatgpt.com/*
@@ -27,6 +27,7 @@
   const uuid = () => crypto.randomUUID();
   const instanceId = uuid(); // Volatile: never restored after reload or copied to another tab.
   let host, ui, registration = null, reservation = null, incoming = null, outgoing = null;
+  let selectedEditor = null, pickingEditor = false, selectionExpired = false;
   let observedHref = location.href, navVersion = 0, copySequence = 0, processing = false, composing = false;
   const consumed = new Set();
   const heardOffers = new Set();
@@ -292,11 +293,32 @@
     return CHAT && registration && canonicalConversation(location.href) === registration.url &&
       registration.receiverId === instanceId && sameBinding(read(KEY.registration), registration);
   }
-  function say(text) { if (ui && ui.status.textContent !== text) ui.status.textContent = text; }
+  function say(text) {
+    if (!ui) return;
+    if (ui.status.textContent !== text) ui.status.textContent = text;
+    if (CHAT && ui.compactStatus) {
+      const code = text.match(/（([A-Z_]+)）/)?.[1];
+      const label = /反映しました/.test(text) ? '入力済み・未送信' :
+        /コピーしました/.test(text) ? 'コピー済み' :
+        /クリックして指定/.test(text) ? '入力欄を選択中' :
+        /未確認|不確か|確認でき|できません|消えました|未対応|置き換わり/.test(text) ? '確認が必要' :
+        /保留/.test(text) ? '入力を保留' : /受取先にしました/.test(text) ? '受取先を指定済み' :
+        /解除|中止|破棄|停止/.test(text) ? '停止中' : /受取待ち|受け取り中/.test(text) ? '受取待ち' : '設定と状態';
+      const summary = label + (code ? ' · ' + code : '');
+      if (ui.compactStatus.textContent !== summary) ui.compactStatus.textContent = summary;
+    }
+  }
+  function clearEditorSelection(expired = false) {
+    selectedEditor = null;
+    pickingEditor = false;
+    selectionExpired = expired;
+    if (ui?.pick) ui.pick.textContent = '入力欄を指定';
+  }
   function stateError() {
     // A failed GM write may already have taken effect. Stop locally, preserve
     // manual text, and never retry a write or insertion as a side effect.
     registration = null;
+    clearEditorSelection();
     if (outgoing) {
       outgoing.controller?.abort();
       outgoing.state = 'blocked';
@@ -325,7 +347,8 @@
     ui.preview.value = text;
     ui.details.hidden = !text;
     ui.copy.disabled = !text;
-    if (text) ui.details.open = true;
+    ui.copy.hidden = !text;
+    if (!text) ui.details.open = false; // Full text expands only by the user's own choice.
   }
   function controls() {
     if (!ui) return;
@@ -334,6 +357,7 @@
     ui.discard.hidden = (QB ? !outgoing : !incoming && !reservation) && !ui.preview.value;
     ui.retry.hidden = !CHAT || !incoming || incoming.attempted || !boundHere();
     ui.disarm.hidden = !CHAT || !registration;
+    if (ui.pick) ui.pick.disabled = processing || !registration;
   }
   function acknowledge(packet, code) {
     write(KEY.ack, {v:1, receiverId:packet.receiverId, epoch:packet.epoch, url:packet.url,
@@ -367,6 +391,7 @@
     controls();
   }
   function invalidateReceiver(message) {
+    clearEditorSelection();
     const oldRegistration = registration;
     const old = incoming || reservation;
     registration = null;
@@ -557,14 +582,97 @@
     }
     return scope;
   }
+  const NAMED_COMPOSER = '#composer-background,[data-testid="composer"],[data-testid="composer-root"],[data-type="unified-composer"]';
+  function excludedEditorContext(editor) {
+    if (editor.getRootNode?.()?.host) return true; // No cross-shadow attachment/context guarantees.
+    return !!editor.closest('article,[data-message-author-role],[data-message-id],[data-testid^="conversation-turn"],[data-testid*="message-edit"],[data-testid*="edit-message"],[role="search"],[role="searchbox"],[role="dialog"],dialog,.monaco-editor,.cm-editor,.CodeMirror,[data-testid="code-editor"]');
+  }
+  function positiveComposerScope(scope, editor) {
+    if (!scope || !editor) return false;
+    for (let ancestor = editor.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (ancestor.matches(NAMED_COMPOSER)) return true;
+      if (ancestor === scope) break;
+    }
+    const form = editor.closest('form');
+    if (!form || !(scope === form || scope.contains(form))) return false;
+    return !!form.querySelector('button[data-testid="send-button"],button[data-testid="stop-button"],button[aria-label="Send prompt"],button[aria-label="Send message"],button[aria-label="メッセージを送信"],button[aria-label="プロンプトを送信"]');
+  }
+  function semanticEditor(editor) {
+    return editor.tagName === 'TEXTAREA' || editor.isContentEditable &&
+      (editor.getAttribute('role') === 'textbox' || editor.getAttribute('aria-multiline') === 'true' ||
+       String(editor.className || '').split(/\s+/).includes('ProseMirror'));
+  }
+  function semanticFallback() {
+    const roots = new Set();
+    // Enumerate only bounded forms/named composer roots, never arbitrary inputs
+    // throughout the document. Every candidate also needs positive composer proof.
+    for (const container of document.querySelectorAll('form,' + NAMED_COMPOSER)) {
+      if (/^(BODY|HTML|MAIN)$/.test(container.tagName)) continue;
+      for (const editor of scopedEditingHosts(container)) {
+        const scope = composerScope(editor);
+        if (semanticEditor(editor) && !excludedEditorContext(editor) && positiveComposerScope(scope,editor)) roots.add(editor);
+      }
+    }
+    return [...roots];
+  }
+  function selectedCandidate() {
+    if (!selectedEditor) return null;
+    if (!selectedEditor.node.isConnected || editingHost(selectedEditor.node) !== selectedEditor.node ||
+        composerScope(selectedEditor.node) !== selectedEditor.scope || selectedEditor.navVersion !== navVersion ||
+        !sameBinding(selectedEditor.binding, registration) || canonicalConversation(location.href) !== selectedEditor.binding.url) {
+      clearEditorSelection(true);
+      return null;
+    }
+    return selectedEditor.node;
+  }
+  function onPickMode(event) {
+    if (!event.isTrusted || !CHAT || processing) return;
+    if (!boundHere()) { say('先にこの会話を受取先にしてください。'); return; }
+    pickingEditor = !pickingEditor;
+    if (!pickingEditor) clearEditorSelection(true);
+    if (incoming) incoming.waitingForFocus = false;
+    ui.pick.textContent = pickingEditor ? '指定をやめる' : '入力欄を指定';
+    say(pickingEditor ? '使う入力欄を1回クリックして指定してください。指定だけでは入力しません。' : '入力欄の指定を中止しました。再指定するか、会話を再登録してください。');
+  }
+  function onPickEditor(event) {
+    if (!pickingEditor || !event.isTrusted || !CHAT || processing) return;
+    if (event.target === host || event.composedPath?.().includes(host)) return;
+    clearEditorSelection(true);
+    if (!boundHere()) { clearEditorSelection(); say('受取先が変わりました。指定し直してください。'); return; }
+    const target = event.target?.nodeType === 1 ? event.target : event.target?.parentElement;
+    const editor = target?.closest ? editingHost(target.closest('textarea,[contenteditable]') || target) : null;
+    const scope = editor && composerScope(editor);
+    // Explicit human designation supplies intent that automatic discovery lacks.
+    // It may omit the send marker, but never semantic editability, bounded scope,
+    // wrong-context exclusions, single-host checks or the later draft protections.
+    if (!editor || !visible(editor) || semanticallyHidden(editor) ||
+        excludedEditorContext(editor) || !scope || /^(BODY|HTML|MAIN)$/.test(scope.tagName)) {
+      say('安全な入力欄として指定できません。（PICK_REJECTED）'); return;
+    }
+    const candidates = scopedEditingHosts(scope);
+    if (candidates.length !== 1 || candidates[0] !== editor) { say('入力欄を一つに絞れません。（SCOPE_MULTI）'); return; }
+    selectedEditor = {node:editor,scope,binding:{...registration},navVersion};
+    selectionExpired = false;
+    const readiness = inspectComposer();
+    const next = incoming && !incoming.attempted ? '「空欄へ入力」で確認してください。' : 'QB側の「指定したChatGPTへ入力」を押してください。';
+    say('入力欄を指定しました。指定だけでは入力しません。' + next + '（' + readiness.reason + '）');
+    controls();
+  }
   function inspectComposer(allowText = false) {
     const unknown = reason => ({code:'unknown',reason});
     const blocked = reason => ({code:'blocked',reason});
-    const matches = [...document.querySelectorAll('#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable][data-testid="prompt-textarea"]')].filter(visible);
-    if (!matches.length) return unknown('EDITOR_NONE');
-    const candidates = [...new Set(matches.map(node => editingHost(node) || node))];
+    if (pickingEditor) return unknown('PICKING_EDITOR');
+    const selected = selectedCandidate();
+    if (selectionExpired) return unknown('SELECTED_GONE');
+    const knownMatches = selected ? [selected] : [...document.querySelectorAll('#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable][data-testid="prompt-textarea"]')];
+    const matches = knownMatches.filter(visible);
+    if (selected && !matches.length) return unknown('EDITOR_HIDDEN');
+    const candidates = matches.length ? [...new Set(matches.map(node => editingHost(node) || node))] : semanticFallback();
+    if (!candidates.length) return unknown(knownMatches.length ? 'EDITOR_HIDDEN' : 'EDITOR_NONE');
     if (candidates.length !== 1) return unknown('EDITOR_MULTI');
     const editor = candidates[0];
+    if (excludedEditorContext(editor)) return unknown('EDITOR_CONTEXT');
+    if (!visible(editor)) return unknown('EDITOR_HIDDEN');
     if (!(editor.tagName === 'TEXTAREA' || editor.isContentEditable)) return unknown('EDITOR_TYPE');
     if (editor.disabled || editor.readOnly || editor.getAttribute('aria-disabled') === 'true' || editor.getAttribute('aria-readonly') === 'true') return unknown('EDITOR_DISABLED');
     if (semanticallyHidden(editor)) return unknown('EDITOR_HIDDEN');
@@ -640,6 +748,9 @@
       if (fresh.code !== 'ready' || fresh.editor !== before.editor || !stillReceivable(packet)) {
         say('入力欄が変わりました。下の全文を手動コピーしてください。'); acknowledge(packet,'blocked'); return;
       }
+      if (document.activeElement !== fresh.editor) {
+        say('入力欄へフォーカスできませんでした。全文を手動コピーしてください。（FOCUS_MISMATCH）'); acknowledge(packet,'blocked'); return;
+      }
       const selection = window.getSelection();
       if (fresh.editor.tagName === 'TEXTAREA') fresh.editor.setSelectionRange(0,0);
       else {
@@ -647,6 +758,11 @@
         range.selectNodeContents(fresh.editor);
         range.collapse(false);
         selection.removeAllRanges(); selection.addRange(range);
+      }
+      if (!stillReceivable(packet)) { say('受取先が変わりました。自動入力はしません。'); return; }
+      const finalBeforeEdit = inspectComposer();
+      if (finalBeforeEdit.code !== 'ready' || finalBeforeEdit.editor !== fresh.editor || document.activeElement !== fresh.editor) {
+        say('入力欄またはフォーカスが変わりました。全文を手動コピーしてください。（FOCUS_MISMATCH）'); acknowledge(packet,'blocked'); return;
       }
       // Consume BEFORE editing. Never retry once browser/framework state may have changed.
       packet.attempted = true;
@@ -690,11 +806,12 @@
     checkLocation();
     const url = canonicalConversation(location.href);
     if (!url) { say('既存の会話（/c/…）を開いて指定してください。'); return; }
+    if (incoming || reservation) { say('先に保留内容を入力または破棄してください。'); return; }
+    clearEditorSelection();
     // Register the exact user-chosen page even while its composer is loading or
     // unsupported. Readiness is a separate gate: receiving never authorizes edits.
     let readiness;
     try { readiness = inspectComposer(); } catch (_) { readiness = {code:'unknown',reason:'INSPECT_ERROR'}; }
-    if (incoming || reservation) { say('先に保留内容を入力または破棄してください。'); return; }
     // Explicit re-registration is also an explicit invalidation of stale routing.
     // It does NOT authorize replaying any old prompt at the new destination.
     write(KEY.payload, null);
@@ -754,31 +871,53 @@
     host = make('section'); host.id = HOST_ID;
     const shadow = host.attachShadow({mode:'open'});
     const style = make('style');
-    style.textContent = ':host{all:initial;font:12px/1.5 sans-serif;color:#172033;color-scheme:light}*{box-sizing:border-box}[hidden]{display:none!important}.panel{background:#fff;border:1px solid #94a3b8;border-radius:7px;padding:7px;max-height:42vh;overflow:auto;overflow-wrap:anywhere}strong{font-size:12px}button{font:inherit;cursor:pointer;margin:3px 4px 3px 0;padding:5px;border:1px solid #94a3b8;border-radius:5px;background:#f8fafc;color:#172033}button:disabled{opacity:.5;cursor:default}p{margin:4px 0}textarea{box-sizing:border-box;width:100%;height:130px;font:11px/1.5 sans-serif}button:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #2563eb}';
+    style.textContent = ':host{all:initial;font:12px/1.5 sans-serif;color:#172033;color-scheme:light}*{box-sizing:border-box}[hidden]{display:none!important}.panel{background:#fff;border:1px solid #94a3b8;border-radius:7px;padding:6px;max-height:42vh;overflow:auto;overflow-wrap:anywhere}.header{display:flex;align-items:center;gap:6px}strong{font-size:12px;flex:1}.compact{font-size:11px;line-height:1.35;color:#475569;margin:1px 0 0}.actions{display:flex;flex-wrap:wrap;gap:3px}button{font:inherit;cursor:pointer;margin:2px 3px 2px 0;padding:4px 6px;border:1px solid #94a3b8;border-radius:5px;background:#f8fafc;color:#172033}button:disabled{opacity:.5;cursor:default}p{margin:4px 0}textarea{box-sizing:border-box;width:100%;height:110px;font:11px/1.5 sans-serif}button:focus-visible,textarea:focus-visible,summary:focus-visible{outline:3px solid #2563eb}';
     const panel = make('div'); panel.className = 'panel';
-    const title = make('strong', '指定ChatGPT入力・実験');
+    const header = make('div'); header.className = 'header';
+    const title = make('strong', CHAT ? 'QB入力・実験' : '指定ChatGPT入力・実験');
+    const toggle = make('button','開く'); toggle.type = 'button'; toggle.hidden = !CHAT;
+    toggle.setAttribute('aria-expanded','false'); toggle.setAttribute('aria-controls','handoff-controls');
+    const compactStatus = make('p'); compactStatus.className = 'compact'; compactStatus.hidden = !CHAT;
+    compactStatus.setAttribute('role','status'); compactStatus.setAttribute('aria-live','polite');
+    const body = make('div'); body.id = 'handoff-controls'; body.hidden = CHAT;
+    const actions = make('div'); actions.className = 'actions';
     const action = make('button', QB ? '指定したChatGPTへ入力' : 'この会話を受取先にする');
     const retry = make('button','空欄へ入力'); retry.hidden = true;
+    const pick = make('button','入力欄を指定'); pick.hidden = !CHAT; pick.disabled = true;
     const discard = make('button','保留を破棄'); discard.hidden = true;
     const disarm = make('button','受取先を解除'); disarm.hidden = true;
-    for (const button of [action,retry,discard,disarm]) button.type = 'button';
+    for (const button of [action,retry,pick,discard,disarm]) button.type = 'button';
     const status = make('p'); status.setAttribute('role','status'); status.setAttribute('aria-live','polite');
-    const details = make('details'); details.hidden = true;
+    const details = make('details'); details.hidden = true; details.open = false;
     const preview = make('textarea'); preview.readOnly = true; preview.setAttribute('aria-label','受け渡しする全文・手動コピー用');
-    const copy = make('button','この全文をコピー'); copy.type = 'button'; copy.disabled = true;
-    details.append(make('summary','受け渡し全文'),preview,copy);
-    panel.append(title,make('p','自動送信なし・画像添付なし・実画面未検証'),action,retry,discard,disarm,status,details);
+    const copy = make('button','この全文をコピー'); copy.type = 'button'; copy.disabled = true; copy.hidden = true;
+    details.append(make('summary','受け渡し全文を見る'),preview);
+    actions.append(action,retry,pick,discard,disarm);
+    body.append(make('p','自動送信なし・画像添付なし・実画面未検証'),actions,status,copy,details);
+    header.append(title,toggle); panel.append(header,compactStatus,body);
     shadow.append(style,panel);
-    ui = {shadow,panel,action,retry,discard,disarm,status,details,preview,copy};
+    ui = {shadow,panel,body,toggle,compactStatus,action,retry,pick,discard,disarm,status,details,preview,copy};
+    toggle.addEventListener('click',guarded(event => {
+      if (!event.isTrusted) return;
+      body.hidden = !body.hidden;
+      toggle.textContent = body.hidden ? '開く' : '閉じる';
+      toggle.setAttribute('aria-expanded',String(!body.hidden));
+      mount();
+    }));
     action.addEventListener('click',guarded(QB ? onSend : onRegister));
     retry.addEventListener('click',guarded(event => { if (event.isTrusted) return requestInput(true); }));
+    pick.addEventListener('click',guarded(onPickMode));
     discard.addEventListener('click',guarded(onDiscard));
     disarm.addEventListener('click',guarded(onDisarm));
     copy.addEventListener('click',guarded(onCopy));
-    say(QB ? 'ChatGPTで受取先を指定してください' : 'この会話を受取先に指定できます。再読み込み後は指定し直してください。');
+    say(QB ? 'ChatGPTで受取先を指定してください' : '「開く」から、この会話を受取先に指定できます。');
   }
   function mount() {
     checkLocation();
+    if (selectedEditor && !selectedEditor.node.isConnected) {
+      clearEditorSelection(true);
+      say('指定した入力欄が置き換わりました。指定し直してください。（SELECTED_GONE）');
+    }
     if (!document.body) return;
     if (!host) makeUI();
     const labRoot = QB ? document.getElementById('qb-ai-explanation-prompt-lab')?.shadowRoot : null;
@@ -798,7 +937,7 @@
     }
     const parent = lab || document.body;
     if (host.parentNode !== parent) parent.append(host);
-    const css = lab ? 'display:block;margin-top:7px;' : 'position:fixed;top:12px;left:12px;width:min(330px,calc(100vw - 24px));z-index:2147483632;';
+    const css = lab ? 'display:block;margin-top:7px;' : 'position:fixed;top:12px;left:12px;width:min(' + (CHAT ? (ui.body.hidden ? '200' : '280') : '330') + 'px,calc(100vw - 24px));z-index:2147483632;';
     if (host.style.cssText !== css) host.style.cssText = css;
   }
   try {
@@ -842,6 +981,7 @@
     const onFocus = guarded(() => { checkLocation(); if (incoming?.waitingForFocus && !incoming.attempted) return requestInput(false); });
     window.addEventListener('focus',onFocus);
     document.addEventListener('visibilitychange',onFocus);
+    document.addEventListener('click',guarded(onPickEditor),true);
     document.addEventListener('compositionstart',() => { composing = true; },true);
     document.addEventListener('compositionend',() => { composing = false; },true);
     const observer = new MutationObserver(guarded(mount));
