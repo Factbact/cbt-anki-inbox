@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QB CBT 復習ラベル固定（△・×）
 // @namespace    https://local.tools/qb-cbt-review-label-lock
-// @version      0.4.12-preview.9
+// @version      0.4.13-preview.16
 // @description  復習アシストを保持し、表示中のページ全文をクリックでコピー。自動送信・コピー間隔なし。
 // @author       ChatGPT
 // @updateURL    https://raw.githubusercontent.com/Factbact/cbt-anki-inbox/main/qb_cbt_review_label_lock.user.js
@@ -1368,7 +1368,7 @@
     return true;
   }
 
-  const MIN_PANEL_WIDTH=250, MIN_PANEL_HEIGHT=155, PANEL_MARGIN=8;
+  const MIN_PANEL_WIDTH=200, MIN_PANEL_HEIGHT=155, PANEL_MARGIN=8;
   function clampPanelGeometry(width,height) {
     return {
       width:Math.max(Math.min(MIN_PANEL_WIDTH,window.innerWidth-16),Math.min(Math.round(width),window.innerWidth-16)),
@@ -1460,7 +1460,7 @@
         :host {all:initial;color-scheme:light;font:13px/1.5 -apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN",Meiryo,sans-serif}
         * {box-sizing:border-box}
         [hidden] {display:none!important}
-        #panel {position:relative;display:flex;flex-direction:column;width:280px;min-width:250px;max-width:calc(100vw - 24px);max-height:calc(100vh - 24px);background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 8px 26px rgba(15,23,42,.16);overflow:visible}
+        #panel {position:relative;display:flex;flex-direction:column;width:280px;min-width:min(200px,calc(100vw - 24px));max-width:calc(100vw - 24px);container:qb-review-panel / inline-size;max-height:calc(100vh - 24px);background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 8px 26px rgba(15,23,42,.16);overflow:visible}
         #top {display:flex;align-items:center;gap:8px;padding:10px 12px;background:#111827;border-bottom:1px solid #1e40af;border-radius:11px 11px 0 0;color:#fff;cursor:grab;touch-action:none;user-select:none}
         #top:active {cursor:grabbing}
         #title {flex:1;min-width:0;font-weight:750;font-size:13px;letter-spacing:.01em;color:#fff}
@@ -1521,6 +1521,19 @@
         #buttons button {font-size:11px;flex:1}
         #resetPosition {width:100%;font-size:11px;margin-top:8px}
         #foot {font-size:11px;color:#475569;line-height:1.5;margin-top:8px}
+        /* The query measures content width: 248px + the two borders = 250px. */
+        @container qb-review-panel (width < 248px) {
+          #top {flex-wrap:wrap;gap:6px;padding:8px}
+          #title {flex:1 0 100%}
+          #top button {flex:0 0 auto;white-space:nowrap}
+          #main {padding:8px}
+          #smartCard {gap:8px;padding:7px}
+          .scoreBlock {min-width:60px}
+          .scoreRight {padding-left:8px}
+          .detailsContent {padding:7px 6px}
+          .compact {flex-direction:column}
+          .compact select,.compact button {width:100%}
+        }
         .resize-handle {position:absolute;z-index:5;touch-action:none;pointer-events:auto;background:transparent}
         .resize-handle:hover {background:rgba(37,99,235,.13)}
         .resize-n {top:-6px;left:15px;right:15px;height:12px;cursor:ns-resize}
