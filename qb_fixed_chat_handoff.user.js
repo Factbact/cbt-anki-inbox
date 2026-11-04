@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QB 指定ChatGPT入力（独立・未検証実験）
 // @namespace    https://local.tools/qb-fixed-chat-handoff
-// @version      0.1.0-experimental.1
+// @version      0.1.0-experimental.2
 // @description  自分で指定した既存のChatGPT会話だけに現在の1問を入力。送信・タブ作成なし。実画面では未検証。
 // @match        https://cbt.medilink-study.com/*
 // @match        https://chatgpt.com/*
@@ -523,38 +523,80 @@
     // Multiple empty paragraphs are still a draft, even if textContent is ''.
     return paragraph.length === 0 || paragraph.length === 1 && paragraph[0].tagName === 'BR';
   }
+  function semanticallyHidden(node) {
+    for (let current = node; current && current.nodeType === 1; current = current.parentElement) {
+      if (current.hidden || current.inert || current.getAttribute('hidden') !== null || current.getAttribute('inert') !== null ||
+          current.getAttribute('aria-hidden') === 'true') return true;
+    }
+    return false;
+  }
+  function editingHost(node) {
+    if (node.tagName === 'TEXTAREA') return node;
+    if (!node.isContentEditable) return null;
+    let root = node;
+    while (root.parentElement?.isContentEditable) root = root.parentElement;
+    return /^(BODY|HTML|FORM)$/.test(root.tagName) ? null : root;
+  }
+  function scopedEditingHosts(scope) {
+    const roots = new Set();
+    for (const node of scope.querySelectorAll('textarea,[contenteditable]')) {
+      const root = editingHost(node);
+      // A hidden/inert mirror or helper is not a second writable editing host.
+      // This exemption is NOT used to pick a hidden primary candidate.
+      if (root && visible(root) && !semanticallyHidden(root)) roots.add(root);
+    }
+    return [...roots];
+  }
+  function composerScope(editor) {
+    let scope = null;
+    // Consider ONLY forms and approved named composer roots. Use the outermost
+    // such root so nested forms/backgrounds cannot hide attachment controls. Unnamed
+    // ancestors never become a scope, and page/main boundaries terminate search.
+    for (let ancestor = editor.parentElement; ancestor && !/^(BODY|HTML|MAIN)$/.test(ancestor.tagName); ancestor = ancestor.parentElement) {
+      if (ancestor.tagName === 'FORM' || ancestor.matches('#composer-background,[data-testid="composer"],[data-testid="composer-root"],[data-type="unified-composer"]')) scope = ancestor;
+    }
+    return scope;
+  }
   function inspectComposer(allowText = false) {
-    const candidates = [...document.querySelectorAll('#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"]')].filter(visible);
-    if (candidates.length !== 1) return {code:'unknown'};
+    const unknown = reason => ({code:'unknown',reason});
+    const blocked = reason => ({code:'blocked',reason});
+    const matches = [...document.querySelectorAll('#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable][data-testid="prompt-textarea"]')].filter(visible);
+    if (!matches.length) return unknown('EDITOR_NONE');
+    const candidates = [...new Set(matches.map(node => editingHost(node) || node))];
+    if (candidates.length !== 1) return unknown('EDITOR_MULTI');
     const editor = candidates[0];
-    if (!(editor.tagName === 'TEXTAREA' || editor.isContentEditable) || editor.disabled || editor.readOnly || editor.getAttribute('aria-disabled') === 'true') return {code:'unknown'};
-    const scope = editor.closest('form');
-    if (!scope) return {code:'unknown'};
-    const other = [...scope.querySelectorAll('textarea,[contenteditable="true"],[contenteditable="plaintext-only"]')].filter(visible);
-    if (other.length !== 1 || other[0] !== editor) return {code:'unknown'};
-    if (composing || scope.getAttribute('aria-busy') === 'true' || editor.getAttribute('aria-busy') === 'true' ||
-        [...document.querySelectorAll('[data-testid="stop-button"],button[aria-label="Stop generating"],button[aria-label="応答を停止"]')].some(visible)) return {code:'blocked'};
+    if (!(editor.tagName === 'TEXTAREA' || editor.isContentEditable)) return unknown('EDITOR_TYPE');
+    if (editor.disabled || editor.readOnly || editor.getAttribute('aria-disabled') === 'true' || editor.getAttribute('aria-readonly') === 'true') return unknown('EDITOR_DISABLED');
+    if (semanticallyHidden(editor)) return unknown('EDITOR_HIDDEN');
+    // Use a form or an enclosing named composer root, including sibling attachment
+    // controls. Only named, bounded roots are accepted without a form. Never body,
+    // main, the entire page, or an arbitrary generic ancestor.
+    const scope = composerScope(editor);
+    if (!scope || /^(BODY|HTML|MAIN)$/.test(scope.tagName) || scope === editor) return unknown('SCOPE_NONE');
+    const other = scopedEditingHosts(scope);
+    if (other.length !== 1 || other[0] !== editor) return unknown('SCOPE_MULTI');
+    if (composing) return blocked('IME');
+    let ancestorBusy = false;
+    for (let node = editor; node; node = node.parentElement) {
+      if (node.getAttribute('aria-busy') === 'true') ancestorBusy = true;
+      if (node === scope) break;
+    }
+    if (ancestorBusy ||
+        [...document.querySelectorAll('[data-testid="stop-button"],button[aria-label="Stop generating"],button[aria-label="応答を停止"]')].some(visible)) return blocked('GENERATING');
     // No trimming: even a whitespace-only user draft is not ours to replace.
-    if (!allowText && !emptyEditor(editor)) return {code:'blocked'};
-    if (editor.querySelector('img,svg,video,audio,canvas,iframe,object,[contenteditable="false"]')) return {code:'blocked'};
-    if ([...scope.querySelectorAll('input[type="file"]')].some(node => node.files?.length)) return {code:'blocked'};
-    if (scope.querySelector('img,video,audio,canvas,[data-file-id],[data-testid="attachment-preview"],[data-testid="file-preview"],[data-testid="image-preview"],[data-testid="composer-attachment"]')) return {code:'blocked'};
+    if (!allowText && !emptyEditor(editor)) return blocked('DRAFT');
+    if (editor.querySelector('img,svg,video,audio,canvas,iframe,object,[contenteditable="false"]')) return blocked('EDITOR_MEDIA');
+    if ([...scope.querySelectorAll('input[type="file"]')].some(node => node.files?.length)) return blocked('FILE_SELECTED');
+    if (scope.querySelector('img,video,audio,canvas,[data-file-id],[data-testid="attachment-preview"],[data-testid="file-preview"],[data-testid="image-preview"],[data-testid="composer-attachment"]')) return blocked('ATTACHMENT');
     for (const node of scope.querySelectorAll('[data-testid],[aria-label]')) {
       const testid = node.getAttribute('data-testid') || '';
       const label = node.getAttribute('aria-label') || '';
-      if (/remove.*(file|image|attachment)|(file|image|attachment).*remove|添付.*削除|画像.*削除|ファイル.*削除|^\s*(remove|delete|削除|取り除く)(?:\s|$)/i.test(label)) return {code:'blocked'};
-      if (!['BUTTON','INPUT','SVG','PATH'].includes(node.tagName) && /(attachment|upload|file-preview|image-preview)/i.test(testid)) return {code:'blocked'};
+      if (/remove.*(file|image|attachment)|(file|image|attachment).*remove|添付.*削除|画像.*削除|ファイル.*削除|^\s*(remove|delete|削除|取り除く)(?:\s|$)/i.test(label)) return blocked('REMOVE_CONTROL');
+      if (!['BUTTON','INPUT','SVG','PATH'].includes(node.tagName) && /(attachment|upload|file-preview|image-preview)/i.test(testid)) return blocked('ATTACHMENT_MARKER');
     }
-    // Fail closed on unexplained visible text (for example, an uploaded filename)
-    // outside the native editor and ordinary labelled controls. No text is saved.
-    const unexplained = node => {
-      if (node === editor) return false;
-      if (node.nodeType === 3) return /\S/.test(node.textContent);
-      if (node.nodeType !== 1 || !visible(node) || /^(BUTTON|INPUT|LABEL|SVG|STYLE|SCRIPT)$/.test(node.tagName) || node.getAttribute('aria-hidden') === 'true') return false;
-      return [...node.childNodes].some(unexplained);
-    };
-    if ([...scope.childNodes].some(unexplained)) return {code:'unknown'};
-    return {code:'ready', editor, scope};
+    // External captions are not evidence of a draft or attachment. Do not read
+    // their text or reject the editor merely because the form has other labels.
+    return {code:'ready',reason:'READY',editor,scope};
   }
   function payloadReceived(value) {
     checkLocation();
@@ -584,7 +626,7 @@
     packet.waitingForFocus = false;
     const before = inspectComposer();
     if (before.code !== 'ready') {
-      say(before.code === 'unknown' ? '入力欄の形式を確認できません。下の全文を手動コピーしてください。' : '下書き・添付・生成中などで保留。空欄にして「空欄へ入力」を押してください。');
+      say((before.code === 'unknown' ? '自動入力を確認できません。下の全文を手動コピーしてください。' : '入力は保留中です。空欄にして「空欄へ入力」を押してください。') + '（' + before.reason + '）');
       acknowledge(packet, before.code); controls(); return;
     }
     if (typeof document.execCommand !== 'function') {
@@ -648,7 +690,10 @@
     checkLocation();
     const url = canonicalConversation(location.href);
     if (!url) { say('既存の会話（/c/…）を開いて指定してください。'); return; }
-    if (inspectComposer().code === 'unknown') { say('この会話の入力欄を確認できません。手動コピーを使ってください。'); return; }
+    // Register the exact user-chosen page even while its composer is loading or
+    // unsupported. Readiness is a separate gate: receiving never authorizes edits.
+    let readiness;
+    try { readiness = inspectComposer(); } catch (_) { readiness = {code:'unknown',reason:'INSPECT_ERROR'}; }
     if (incoming || reservation) { say('先に保留内容を入力または破棄してください。'); return; }
     // Explicit re-registration is also an explicit invalidation of stale routing.
     // It does NOT authorize replaying any old prompt at the new destination.
@@ -657,7 +702,8 @@
     registration = {v:1, receiverId:instanceId, epoch:uuid(), url};
     write(KEY.registration, registration);
     showText('');
-    say('このタブを受取先にしました。QBの「指定したChatGPTへ入力」を押してください。');
+    say(readiness.code === 'ready' ? 'このタブを受取先にしました。QBの「指定したChatGPTへ入力」を押してください。' :
+      'このタブを受取先にしました。自動入力は未確認です（' + readiness.reason + '）。受信した全文は手動コピーできます。');
     controls();
   }
   async function onCopy(event) {
